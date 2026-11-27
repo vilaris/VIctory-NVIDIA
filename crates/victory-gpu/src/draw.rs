@@ -1896,7 +1896,7 @@ impl State {
                 // SAFETY: `barriers[..*count]` were initialized below.
                 let slice = unsafe { std::slice::from_raw_parts(barriers.as_ptr().cast::<D3D12_RESOURCE_BARRIER>(), *count) };
                 // SAFETY: an open list and live textures.
-                unsafe { l.ResourceBarrier(slice) };
+                unsafe { crate::rf_x2::barriers(l, "vx:barrier.targets", slice) }; // rf-x2
                 *count = 0;
             }
         };
@@ -2052,6 +2052,7 @@ impl State {
         if self.host_pipeline != p.pso.as_raw() as usize {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
+            crate::rf_x2::bind_title(list, p); // rf-x2
             self.host_pipeline = p.pso.as_raw() as usize;
             // The title may release the pipeline before it submits the list.
             list.bind_pipeline(&p.name, &p.pso, &p.root);
@@ -2949,7 +2950,7 @@ impl State {
             if bake_slot.is_none()
                 && let Some(gpu) = gpu
             {
-                match gpu.new_list() {
+                match gpu.new_list_for(crate::rf_x2::Origin::Copy) { // rf-x2
                     Ok(upload_list) => *bake_slot = Some(BakeList(upload_list)),
                     Err(e) => tracing::warn!(error = %e, "no host list for synchronous bake uploads"),
                 }

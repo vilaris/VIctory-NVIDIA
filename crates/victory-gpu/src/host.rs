@@ -1390,6 +1390,7 @@ const BATCHES: u32 = 8;
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
+    pub(crate) rf_x2: Option<Box<crate::rf_x2::Recording>>, // rf-x2
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -1862,6 +1863,7 @@ fn record_twin_copy(
     twin: &crate::resource::Twin,
     colour: bool,
 ) {
+    let _rf_x2 = crate::rf_x2::range(list, "vx:tex.depth"); // rf-x2
     let (from, to) = if colour {
         (depth, &twin.colour.texture)
     } else {
@@ -1930,17 +1932,17 @@ fn record_twin_copy(
     // SAFETY: an open list and live resources; the buffer was made as big
     // as these footprints, and rests in the common state between copies.
     unsafe {
-        list.ResourceBarrier(&[transition(through, common, dest)]);
+        crate::rf_x2::barriers(list, "vx:barrier.tex.copy", &[transition(through, common, dest)]); // rf-x2
         for (i, row) in rows.iter().enumerate() {
             let index = first_from + i as u32;
             list.CopyTextureRegion(&placed(row), 0, 0, 0, &subresource(from, index), None);
         }
-        list.ResourceBarrier(&[transition(through, dest, source)]);
+        crate::rf_x2::barriers(list, "vx:barrier.tex.copy", &[transition(through, dest, source)]); // rf-x2
         for (i, row) in rows.iter().enumerate() {
             let index = first_to + i as u32;
             list.CopyTextureRegion(&subresource(to, index), 0, 0, 0, &placed(row), None);
         }
-        list.ResourceBarrier(&[transition(through, source, common)]);
+        crate::rf_x2::barriers(list, "vx:barrier.tex.copy", &[transition(through, source, common)]); // rf-x2
     }
 }
 
@@ -4786,11 +4788,15 @@ impl Host {
 
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
+        self.new_list_for(crate::rf_x2::Origin::Coherence) // rf-x2
+    }
+
+    pub(crate) fn new_list_for(&self, origin: crate::rf_x2::Origin) -> windows::core::Result<HostList> { // rf-x2
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let before = private_bytes();
-        let list = self.make_list();
+        let list = self.make_list(origin); // rf-x2
         LISTS[0].fetch_add(1, Ordering::Relaxed);
         // (May shrink while a list is made, on another thread's account:
         // added as it is, the sum is what counts.)
@@ -4829,7 +4835,7 @@ impl Host {
         }
     }
 
-    fn make_list(&self) -> windows::core::Result<HostList> {
+    fn make_list(&self, origin: crate::rf_x2::Origin) -> windows::core::Result<HostList> { // rf-x2
         // SAFETY: plain object creation.
         unsafe {
             let allocator: ID3D12CommandAllocator = self
@@ -4880,11 +4886,13 @@ impl Host {
                 all.insert(number, std::sync::Arc::downgrade(&pipelines));
             }
             // (made open: it is recorded from here on)
+            let rf_x2 = crate::rf_x2::Recording::new(&list, origin); // rf-x2
             let gpu_time = gpu_time::List::default();
             gpu_time.start(&list);
             Ok(HostList {
                 allocator,
                 list,
+                rf_x2, // rf-x2
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
@@ -5117,6 +5125,8 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    crate::rf_x2::open(list, crate::rf_x2::Origin::Coherence); // rf-x2
+                    crate::rf_x2::begin(list, "vx:coh.send"); // rf-x2
                     let mut timed = gpu_time::Ours::begin(list, "ours: title bytes sent up to the card's copies, then hashed");
                     if upcheck::on() {
                         looks = upcheck::record(self, list, &dirty);
@@ -5156,8 +5166,10 @@ impl Host {
                         }
                     }
                     if !sent.is_empty() {
-                        list.ResourceBarrier(&sent);
+                        crate::rf_x2::barriers(list, "vx:barrier.coh.send", &sent); // rf-x2
                     }
+                    crate::rf_x2::end(list); // rf-x2
+                    crate::rf_x2::begin(list, "vx:coh.hash"); // rf-x2
                     timed.pass(list, "ours: hashes of the pieces sent up");
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
@@ -5212,6 +5224,8 @@ impl Host {
                         }
                     }
                     timed.end(list);
+                    crate::rf_x2::end(list); // rf-x2
+                    crate::rf_x2::end(list); // rf-x2
                     list.Close()?;
                     self.queue_send(&[Some(list.cast()?)], &[], None)?;
                     Ok(())
@@ -5300,9 +5314,11 @@ impl Host {
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    crate::rf_x2::open(list, crate::rf_x2::Origin::Coherence); // rf-x2
+                    crate::rf_x2::begin(list, "vx:coh.compare"); // rf-x2
                     let mut timed = gpu_time::Ours::begin(list, "ours: compares of the card's copies after the lists");
                     // What the submission's shaders wrote, first.
-                    list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                    crate::rf_x2::barriers(list, "vx:barrier.coh.compare", &[D3D12_RESOURCE_BARRIER { // rf-x2
                         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
                         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
                         Anonymous: D3D12_RESOURCE_BARRIER_0 {
@@ -5356,11 +5372,13 @@ impl Host {
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                         i = j;
                     }
+                    crate::rf_x2::end(list); // rf-x2
                     if flown && prefetch::on() {
                         timed.pass(list, "ours: flagged pieces copied down (prefetch)");
                         plan.prefetch = prefetch::record(self, list, &plan.ranges, &compares, &work.differs.0, first_result, at);
                     }
                     timed.end(list);
+                    crate::rf_x2::end(list); // rf-x2
                     list.Close()?;
                     list.cast()
                 })()
@@ -5498,9 +5516,14 @@ impl Host {
             (|| -> windows::core::Result<()> {
                 allocator.Reset()?;
                 list.Reset(allocator, None)?;
+                crate::rf_x2::open(list, crate::rf_x2::Origin::Copy); // rf-x2
+                crate::rf_x2::begin(list, "vx:coh.fetch"); // rf-x2
                 list.CopyBufferRegion(&staging, 0, src, offset, need);
+                crate::rf_x2::end(list); // rf-x2
+                crate::rf_x2::end(list); // rf-x2
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
+                crate::rf_x2::submitted(&lists); // rf-x2
                 df.queue.ExecuteCommandLists(&lists);
                 df.queue.Signal(&df.fence, sent)?;
                 df.fence.SetEventOnCompletion(sent, df.event)?;
@@ -5778,6 +5801,8 @@ impl Host {
                 (|| -> windows::core::Result<u64> {
                     allocator.Reset()?;
                     list.Reset(&allocator, None)?;
+                    crate::rf_x2::open(&list, crate::rf_x2::Origin::Copy); // rf-x2
+                    crate::rf_x2::begin(&list, "vx:relay"); // rf-x2
                     // (timed on the host queue only: a copy queue's clock is another)
                     let timed = copy_queue.is_none().then(|| gpu_time::Ours::begin(&list, "ours: the relay's fetch of what shaders wrote"));
                     for (shadow, lo, hi, at) in check.as_ref().map_or(&fetching, |c| &c.copies) {
@@ -5786,10 +5811,13 @@ impl Host {
                     if let Some(timed) = timed {
                         timed.end(&list);
                     }
+                    crate::rf_x2::end(&list); // rf-x2
+                    crate::rf_x2::end(&list); // rf-x2
                     list.Close()?;
                     let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                     let _fetching = crate::timeline::span("landing: fetching pieces");
                     if let Some(queue) = &copy_queue {
+                        crate::rf_x2::submitted(&lists); // rf-x2
                         queue.ExecuteCommandLists(&lists);
                         queue.Signal(&fence, sent)?;
                         meanwhile();
@@ -6117,11 +6145,15 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    crate::rf_x2::open(list, crate::rf_x2::Origin::Copy); // rf-x2
+                    crate::rf_x2::begin(list, "vx:coh.fetch"); // rf-x2
                     let timed = gpu_time::Ours::begin(list, "ours: pieces of the card's copies fetched");
                     for &(i, lo, hi, at) in &pieces {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
                     timed.end(list);
+                    crate::rf_x2::end(list); // rf-x2
+                    crate::rf_x2::end(list); // rf-x2
                     list.Close()?;
                     *submitted += 1;
                     self.queue_send(&[Some(list.cast()?)], &[], Some((&self.fence, *submitted)))?;
@@ -7352,6 +7384,7 @@ impl HostList {
     /// targets change ([`Self::gpu_pass_break`]), each compute pipeline's
     /// run of dispatches is one. `name` is asked only for a new pass.
     pub(crate) fn gpu_pass(&self, compute: bool, pipeline: usize, command: render_trace::Command, name: impl FnOnce() -> String) {
+        crate::rf_x2::title_work(self); // rf-x2
         self.gpu_time.work();
         let (key, kind) = if compute { (pipeline as u64 | 1, gpu_time::COMPUTE) } else { (2, gpu_time::DRAW) };
         self.gpu_time.pass(&self.list, key, kind, command, name);
@@ -7531,6 +7564,7 @@ impl HostList {
             }
         }
         // SAFETY: our list.
+        crate::rf_x2::Recording::close(self.rf_x2.as_deref(), &self.list); // rf-x2
         if let Err(e) = unsafe { self.list.Close() } {
             fail(format_args!(
                 "a host command list did not close ({e}): a command recorded into it was invalid"
@@ -7606,6 +7640,7 @@ impl HostList {
         }
         FRESH_OPEN[2].fetch_add(1, Ordering::Relaxed);
         // SAFETY: our list, open; what went into it goes with the reset.
+        crate::rf_x2::Recording::close(self.rf_x2.as_deref(), &self.list); // rf-x2
         let _ = unsafe { self.list.Close() };
         false
     }
@@ -7672,6 +7707,7 @@ impl HostList {
             if let Err(e) = reset {
                 fail(format_args!("a host command list did not reset ({e})"));
             }
+            crate::rf_x2::Recording::reopen(self.rf_x2.as_deref(), &self.list); // rf-x2
             self.gpu_time.start(&self.list);
         }
         #[cfg(feature = "diagnostics")]
@@ -7733,6 +7769,7 @@ impl HostList {
             if render_trace::active() {
                 self.gpu_pass(run.kind == 2, run.pipeline, render_trace::Command("execute_indirect_merged", [run.kind.into(), run.records.into(), run.at as i64, 0, run.step.into()]), || format!("indirect pipeline {:#x}", run.pipeline));
             } else {
+                crate::rf_x2::title_work(self); // rf-x2
                 self.gpu_time.work();
             }
             held.record(&self.list, run);
@@ -7815,7 +7852,7 @@ impl HostList {
                 D3D12_RESOURCE_STATES(wanted as i32),
             );
             // SAFETY: an open list and a live texture.
-            unsafe { self.list.ResourceBarrier(&[barrier]) };
+            unsafe { crate::rf_x2::barriers(&self.list, "vx:barrier.tex.state", &[barrier]) }; // rf-x2
         }
     }
 
@@ -7915,6 +7952,7 @@ impl HostList {
         const DEPTH_WRITE: u32 = 0x10;
         const PIXEL_SHADER_RESOURCE: u32 = 0x80;
         let Some(plane) = &twin.plane else { return };
+        let _rf_x2 = crate::rf_x2::range(&self.list, "vx:tex.depth"); // rf-x2
         self.settle(depth, DEPTH_WRITE);
         self.settle(plane, PIXEL_SHADER_RESOURCE);
         record_plane_pass(&self.list, &depth.texture, &plane.texture);
@@ -7995,6 +8033,7 @@ impl HostList {
     /// Before the list closes: the textures its shaders wrote that are copied
     /// back go into read-back buffers ([`crate::texback::record`]).
     fn textures_back(&self) {
+        let _rf_x2 = crate::rf_x2::range(&self.list, "vx:tex.copy"); // rf-x2
         const COPY_SOURCE: u32 = 0x800;
         let wanted = std::mem::take(&mut self.deferred().back_wanted);
         for target in wanted {
@@ -8133,12 +8172,13 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
+                crate::rf_x2::open(list, crate::rf_x2::Origin::Prelude); // rf-x2
                 let mut timed = gpu_time::Ours::begin(list, "ours: a list's state prelude (states, depth twins)");
                 if !aliasing.is_empty() {
-                    list.ResourceBarrier(&aliasing);
+                    crate::rf_x2::barriers(list, "vx:barrier.prelude", &aliasing); // rf-x2
                 }
                 if !to_copy.is_empty() {
-                    list.ResourceBarrier(&to_copy);
+                    crate::rf_x2::barriers(list, "vx:barrier.prelude", &to_copy); // rf-x2
                 }
                 for (depth, twin, colour) in &syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
@@ -8150,9 +8190,10 @@ impl HostList {
                     upload.record(list);
                 }
                 if !barriers.is_empty() {
-                    list.ResourceBarrier(&barriers);
+                    crate::rf_x2::barriers(list, "vx:barrier.prelude", &barriers); // rf-x2
                 }
                 timed.end(list);
+                crate::rf_x2::end(list); // rf-x2
                 list.Close()
             })
         };
@@ -8548,13 +8589,13 @@ impl HostList {
         // SAFETY: an open list; the buffer is the list's own and in the
         // common state at the start of every recording.
         unsafe {
-            self.list.ResourceBarrier(&[transition(
+            crate::rf_x2::barriers(&self.list, "vx:barrier.indirect", &[transition( // rf-x2
                 card,
                 D3D12_RESOURCE_STATE_COMMON,
                 D3D12_RESOURCE_STATE_COPY_DEST,
             )]);
             list2.WriteBufferImmediate(zeros.len() as u32, zeros.as_ptr(), None);
-            self.list.ResourceBarrier(&[transition(
+            crate::rf_x2::barriers(&self.list, "vx:barrier.indirect", &[transition( // rf-x2
                 card,
                 D3D12_RESOURCE_STATE_COPY_DEST,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -8577,13 +8618,13 @@ impl HostList {
         // SAFETY: an open list; both buffers are the list's own. The
         // mapped one is promoted from common to the copy destination.
         unsafe {
-            self.list.ResourceBarrier(&[transition(
+            crate::rf_x2::barriers(&self.list, "vx:barrier.indirect", &[transition( // rf-x2
                 card,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
             self.list.CopyBufferRegion(mapped, 4, card, 4, 16);
-            self.list.ResourceBarrier(&[transition(
+            crate::rf_x2::barriers(&self.list, "vx:barrier.indirect", &[transition( // rf-x2
                 card,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
                 D3D12_RESOURCE_STATE_COMMON,
@@ -8653,7 +8694,7 @@ impl HostList {
         if !barriers.is_empty() {
             // SAFETY: an open list and live buffers this recording left in
             // `INDIRECT_ARGUMENT`.
-            unsafe { self.list.ResourceBarrier(&barriers) };
+            unsafe { crate::rf_x2::barriers(&self.list, "vx:barrier.indirect", &barriers) }; // rf-x2
         }
     }
 
@@ -8678,7 +8719,7 @@ impl HostList {
         );
         // SAFETY: an open list and a live buffer this recording left in
         // `INDIRECT_ARGUMENT`.
-        unsafe { self.list.ResourceBarrier(&[barrier]) };
+        unsafe { crate::rf_x2::barriers(&self.list, "vx:barrier.indirect", &[barrier]) }; // rf-x2
     }
 
     /// The state the list's indirect scratch buffer `scratch` is in at this
@@ -11167,7 +11208,7 @@ impl Host {
             let slot = if late_free_present() && !read_now {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
-                    let list = self.new_list().ok()?;
+                    let list = self.new_list_for(crate::rf_x2::Origin::Copy).ok()?; // rf-x2
                     list.close();
                     p.ahead.push((list, 0));
                     Some(p.ahead.len() - 1)
@@ -11194,7 +11235,7 @@ impl Host {
                         pre.push(transition(over, over_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
                     }
                     pre.push(transition(&back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET));
-                    list.ResourceBarrier(&pre);
+                    crate::rf_x2::barriers(list, "vx:barrier.present", &pre); // rf-x2
                     let compose_slot = slot.map_or(0, |i| i + 1);
                     if let Err(err) = composer.record(
                         self,
@@ -11233,7 +11274,7 @@ impl Host {
                         D3D12_RESOURCE_STATE_RENDER_TARGET,
                         D3D12_RESOURCE_STATE_COPY_DEST,
                     ));
-                    list.ResourceBarrier(&post);
+                    crate::rf_x2::barriers(list, "vx:barrier.present", &post); // rf-x2
                     true
                 } else {
                     false
@@ -11254,20 +11295,21 @@ impl Host {
                     D3D12_RESOURCE_STATE_PRESENT,
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 ));
-                list.ResourceBarrier(&pre);
+                let _rf_x2 = crate::rf_x2::range(list, "vx:present.copy"); // rf-x2
+                crate::rf_x2::barriers(list, "vx:barrier.present", &pre); // rf-x2
                 list.CopyResource(&back, texture);
             }
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| {
                     if composed {
-                        list.ResourceBarrier(&[transition(
+                        crate::rf_x2::barriers(list, "vx:barrier.present", &[transition( // rf-x2
                             &back,
                             D3D12_RESOURCE_STATE_COPY_DEST,
                             D3D12_RESOURCE_STATE_COPY_SOURCE,
                         )]);
                         let res = crate::capture::read_back(&self.device, list, &back);
-                        list.ResourceBarrier(&[transition(
+                        crate::rf_x2::barriers(list, "vx:barrier.present", &[transition( // rf-x2
                             &back,
                             D3D12_RESOURCE_STATE_COPY_SOURCE,
                             D3D12_RESOURCE_STATE_COPY_DEST,
@@ -11293,13 +11335,15 @@ impl Host {
             if render_trace::active() {
                 copy.gpu_pass_ours(6, "present: performance panel and menu");
             }
+            crate::rf_x2::begin(list, "vx:present.overlay"); // rf-x2
             p.panel.draw(self, copy, &back, (width, height), format);
             p.notice.draw(self, copy, &back, (width, height), format);
             p.menu.draw(self, copy, &back, (width, height), format);
+            crate::rf_x2::end(list); // rf-x2
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             if composed {
-                list.ResourceBarrier(&[transition(
+                crate::rf_x2::barriers(list, "vx:barrier.present", &[transition( // rf-x2
                     &back,
                     D3D12_RESOURCE_STATE_COPY_DEST,
                     D3D12_RESOURCE_STATE_PRESENT,
@@ -11314,7 +11358,7 @@ impl Host {
                     D3D12_RESOURCE_STATE_COPY_DEST,
                     D3D12_RESOURCE_STATE_PRESENT,
                 ));
-                list.ResourceBarrier(&post);
+                crate::rf_x2::barriers(list, "vx:barrier.present", &post); // rf-x2
             }
             // FSR 3 frame generation: this frame's prepare dispatch, last in
             // the list before the Present (its own descriptor heaps).
@@ -11463,7 +11507,7 @@ impl Host {
                     factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?.cast::<IDXGISwapChain3>()?,
                 ),
             } };
-            let copy = self.new_list()?;
+            let copy = self.new_list_for(crate::rf_x2::Origin::Copy)?; // rf-x2
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
             self.log_video_memory("right after the swap chain is made");

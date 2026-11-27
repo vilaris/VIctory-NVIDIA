@@ -277,15 +277,18 @@ impl Worker {
         unsafe {
             self.allocator.Reset()?;
             self.list.Reset(&self.allocator, None)?;
+            crate::rf_x2::open(&self.list, crate::rf_x2::Origin::Copy); // rf-x2
             for job in jobs {
                 job.record(&self.list);
             }
+            crate::rf_x2::end(&self.list); // rf-x2
             self.list.Close()?;
             let lists = [Some(self.list.cast()?)];
             let trace_start = crate::host::render_trace::active().then(crate::host::now_us);
             if trace_start.is_some() {
                 crate::host::render_trace::execute(&self.queue, &lists, Some((self.fence.as_raw() as usize, value)));
             }
+            crate::rf_x2::submitted(&lists); // rf-x2
             self.queue.ExecuteCommandLists(&lists);
             self.queue.Signal(&self.fence, value)?;
             // (Without an event: this waits.)
@@ -302,6 +305,7 @@ impl Job {
     /// # Safety
     /// `list` is an open copy list, and the job lives until it has run.
     unsafe fn record(&self, list: &ID3D12GraphicsCommandList) {
+        let _rf_x2 = crate::rf_x2::range(list, "vx:tex.copy"); // rf-x2
         let (s, texture) = (&self.staging, &self.copy.texture);
         for (i, footprint) in s.footprints.iter().enumerate() {
             let to = D3D12_TEXTURE_COPY_LOCATION {

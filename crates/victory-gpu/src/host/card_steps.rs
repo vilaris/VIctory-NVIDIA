@@ -658,9 +658,10 @@ fn record(
     // them. The buffers start in the common state (the list is the first of
     // its call) and are promoted by their first use.
     unsafe {
+        let _rf_x2 = crate::rf_x2::range(list, "vx:card.steps"); // rf-x2
         if first {
             // What earlier lists' shaders wrote, first.
-            list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+            crate::rf_x2::barriers(list, "vx:barrier.card.steps", &[D3D12_RESOURCE_BARRIER { // rf-x2
                 Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
                 Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
                 Anonymous: D3D12_RESOURCE_BARRIER_0 {
@@ -670,17 +671,17 @@ fn record(
                 },
             }]);
         } else {
-            list.ResourceBarrier(&[transition(between, constants, dest)]);
+            crate::rf_x2::barriers(list, "vx:barrier.card.steps", &[transition(between, constants, dest)]); // rf-x2
         }
         for (buffer, offset, at, len) in joined(reads, true) {
             list.CopyBufferRegion(between, at, buffer, offset, len);
         }
-        list.ResourceBarrier(&barriers);
+        crate::rf_x2::barriers(list, "vx:barrier.card.steps", &barriers); // rf-x2
         for (buffer, offset, at, len) in joined(writes, false) {
             list.CopyBufferRegion(buffer, offset, between, at, len);
         }
         if !done.is_empty() {
-            list.ResourceBarrier(&done);
+            crate::rf_x2::barriers(list, "vx:barrier.card.steps", &done); // rf-x2
         }
     }
 }

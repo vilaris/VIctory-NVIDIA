@@ -536,8 +536,9 @@ fn record_clamp_as(
     );
     let skip = usize::from(!waits);
     unsafe {
+        let _rf_x2 = crate::rf_x2::range(l, "vx:indirect.clamp"); // rf-x2
         // Earlier shader writes (the title's argument and count passes) first.
-        l.ResourceBarrier(&first[skip..]);
+        crate::rf_x2::barriers(l, "vx:barrier.indirect", &first[skip..]); // rf-x2
         if records > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
@@ -548,7 +549,7 @@ fn record_clamp_as(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&[after]);
+        crate::rf_x2::barriers(l, "vx:barrier.indirect", &[after]); // rf-x2
     }
     true
 }

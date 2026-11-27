@@ -654,10 +654,10 @@ impl Menu {
         unsafe {
             if std::mem::take(&mut buffers.fresh) {
                 if std::mem::replace(&mut buffers.used, true) {
-                    list.ResourceBarrier(&[transition(&buffers.card, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                    crate::rf_x2::barriers(list, "vx:barrier.present", &[transition(&buffers.card, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST)]); // rf-x2
                 }
                 list.CopyResource(&buffers.card, &buffers.uploads[buffers.turn].0);
-                list.ResourceBarrier(&[transition(&buffers.card, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                crate::rf_x2::barriers(list, "vx:barrier.present", &[transition(&buffers.card, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]); // rf-x2
             }
             let from = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: std::mem::transmute_copy(&buffers.card),

@@ -568,7 +568,7 @@ fn pass() -> Option<&'static Pass> {
 fn uav_barrier(list: &ID3D12GraphicsCommandList) {
     let barrier = D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, ..Default::default() };
     // SAFETY: an open list; the barrier names no resource.
-    unsafe { list.ResourceBarrier(&[barrier]) };
+    unsafe { crate::rf_x2::barriers(list, "vx:barrier.ambient", &[barrier]) }; // rf-x2
 }
 
 /// Whether the light of a frame has been kept: the estimate has something
@@ -738,6 +738,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
         l.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
         let run = |name, pso: &ID3D12PipelineState, x: u32, y: u32, z: u32| {
+            let _rf_x2 = crate::rf_x2::ambient_range(l, name); // rf-x2
             list.trace_gpu_pass(name, [x.into(), y.into(), z.into(), 0, 0]);
             l.SetPipelineState(pso);
             l.Dispatch(x, y, z);

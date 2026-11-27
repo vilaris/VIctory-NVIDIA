@@ -215,7 +215,7 @@ unsafe fn wait_for_all(host: &Host, list: &ID3D12GraphicsCommandList) {
                 AccessBefore: D3D12_BARRIER_ACCESS_COMMON,
                 AccessAfter: D3D12_BARRIER_ACCESS_COMMON,
             }];
-            list.Barrier(&[D3D12_BARRIER_GROUP {
+            crate::rf_x2::global_barrier(&list, &[D3D12_BARRIER_GROUP { // rf-x2
                 Type: D3D12_BARRIER_TYPE_GLOBAL,
                 NumBarriers: 1,
                 Anonymous: D3D12_BARRIER_GROUP_0 {
@@ -243,7 +243,7 @@ unsafe fn wait_for_all(host: &Host, list: &ID3D12GraphicsCommandList) {
                 }),
             },
         };
-        list.ResourceBarrier(&[alias, uav]);
+        crate::rf_x2::barriers(list, "vx:barrier.place", &[alias, uav]); // rf-x2
     }
 }
 
@@ -276,6 +276,7 @@ impl HostList {
             None => return false,
         };
         let at = to.offset(dst as u64);
+        let _rf_x2 = crate::rf_x2::range(&self.list, "vx:coh.place"); // rf-x2
         // What the title's CPU wrote around and under it so far goes first.
         to.refresh(self, dst as u64, len as u64);
         // SAFETY (both): an open list; live buffers (the list holds the
@@ -291,7 +292,7 @@ impl HostList {
                     };
                     unsafe {
                         self.list.CopyBufferRegion(&between, 0, &from.buffer, offset, len as u64);
-                        self.list.ResourceBarrier(&[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                        crate::rf_x2::barriers(&self.list, "vx:barrier.place", &[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]); // rf-x2
                         wait_for_all(host, &self.list);
                         self.list.CopyBufferRegion(&to.buffer, at, &between, 0, len as u64);
                     }
@@ -333,13 +334,14 @@ impl HostList {
         let host = host()?;
         let from = shaders_own(src, len)?;
         let between = self.between(host, len as u64, Kind::UavTextureSupport)?;
+        let _rf_x2 = crate::rf_x2::range(&self.list, "vx:coh.place"); // rf-x2
         from.refresh(self, src as u64, len as u64);
         STATS[3].fetch_add(1, Ordering::Relaxed);
         // SAFETY: an open list; live buffers, ranges inside them.
         unsafe {
             wait_for_all(host, &self.list);
             self.list.CopyBufferRegion(&between, 0, &from.buffer, from.offset(src as u64), len as u64);
-            self.list.ResourceBarrier(&[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            crate::rf_x2::barriers(&self.list, "vx:barrier.place", &[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]); // rf-x2
             wait_for_all(host, &self.list);
         }
         Some(between)
@@ -386,12 +388,13 @@ impl HostList {
         // inside them. A new buffer is in the common state and promoted by
         // the copy; one used before was left readable below.
         unsafe {
+            let _rf_x2 = crate::rf_x2::range(&self.list, "vx:coh.place"); // rf-x2
             wait_for_all(host, &self.list);
             if !fresh {
-                self.list.ResourceBarrier(&[transition(&buffer, read, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                crate::rf_x2::barriers(&self.list, "vx:barrier.place", &[transition(&buffer, read, D3D12_RESOURCE_STATE_COPY_DEST)]); // rf-x2
             }
             self.list.CopyBufferRegion(&buffer, at, &from.buffer, from.offset(src as u64), len as u64);
-            self.list.ResourceBarrier(&[transition(&buffer, D3D12_RESOURCE_STATE_COPY_DEST, read)]);
+            crate::rf_x2::barriers(&self.list, "vx:barrier.place", &[transition(&buffer, D3D12_RESOURCE_STATE_COPY_DEST, read)]); // rf-x2
         }
         self.deferred().constants = Some((buffer.clone(), at + size));
         STATS[4].fetch_add(1, Ordering::Relaxed);

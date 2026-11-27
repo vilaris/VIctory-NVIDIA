@@ -649,7 +649,7 @@ impl Own {
         // SAFETY: the caller's; live objects.
         unsafe {
             if !first.is_empty() {
-                list.ResourceBarrier(&first);
+                crate::rf_x2::barriers(list, "vx:barrier.coh.send", &first); // rf-x2
             }
             let srv_gpu = self
                 .memory
@@ -659,6 +659,7 @@ impl Own {
             if let Some(bulk) = bulk_pass(host)
                 && self.copies.iter().any(|c| c.tiles.1 > 0)
             {
+                let _rf_x2 = crate::rf_x2::range(list, "vx:coh.send.bulk"); // rf-x2
                 list.SetComputeRootSignature(&bulk.root);
                 list.SetPipelineState(&bulk.pso);
                 list.SetComputeRootShaderResourceView(1, srv_gpu);
@@ -678,6 +679,7 @@ impl Own {
             if let Some(pass) = pass(host)
                 && self.copies.iter().any(|c| c.pairs.1 > 0)
             {
+                let _rf_x2 = crate::rf_x2::range(list, "vx:coh.send.scatter"); // rf-x2
                 list.SetComputeRootSignature(&pass.root);
                 list.SetPipelineState(&pass.pso);
                 list.SetComputeRootShaderResourceView(1, srv_gpu);
@@ -696,7 +698,7 @@ impl Own {
                 }
             }
             if !last.is_empty() {
-                list.ResourceBarrier(&last);
+                crate::rf_x2::barriers(list, "vx:barrier.coh.send", &last); // rf-x2
             }
         }
         super::gpu_time::count_sent_runs(made, recorded);

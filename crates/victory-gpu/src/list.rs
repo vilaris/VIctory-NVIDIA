@@ -134,6 +134,8 @@ struct List {
     /// ([`thin`]; then there is no `host`).
     #[cfg(windows)]
     thin: thin::Front,
+    #[cfg(windows)]
+    rf_x2_thin: bool, // rf-x2
 }
 
 /// One part of a title list cut at its waits: the waits the queue stands
@@ -335,7 +337,7 @@ fn pools() -> bool {
 /// A host list open for recording: one that has run, as a title's list is
 /// after its reset, or a new one.
 #[cfg(windows)]
-fn fresh_list() -> Option<crate::host::HostList> {
+fn fresh_list(lowered: bool) -> Option<crate::host::HostList> { // rf-x2
     let idle = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         let taken = idle.0.pop();
@@ -345,8 +347,8 @@ fn fresh_list() -> Option<crate::host::HostList> {
         taken
     };
     match idle {
-        Some(Idle(list, _)) => Some(list),
-        None => crate::host::host().and_then(|h| h.new_list().ok()),
+        Some(Idle(list, _)) => Some(crate::rf_x2::reuse_title(list, lowered)), // rf-x2
+        None => crate::host::host().and_then(|h| h.new_list_for(crate::rf_x2::title_origin(lowered)).ok()), // rf-x2
     }
 }
 
@@ -465,7 +467,7 @@ fn cut(this: This, wait: ValueWait) {
         list.gate.push(wait);
         return;
     }
-    let Some(fresh) = fresh_list() else {
+    let Some(fresh) = fresh_list(list.rf_x2_thin) else { // rf-x2
         // shortcut: without a new host list the wait stands before the part
         // it was recorded in.
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -542,7 +544,8 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
-        let Some(fresh) = fresh_list() else {
+        // SAFETY: one of our lists, closed and submitted.
+        let Some(fresh) = fresh_list(unsafe { (*this.cast::<List>()).rf_x2_thin }) else { // rf-x2
             continue;
         };
         // A new host list is open; the title's next call on its list is a
@@ -616,7 +619,8 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
-        let Some(fresh) = fresh_list() else {
+        // SAFETY: one of our lists, closed and submitted.
+        let Some(fresh) = fresh_list(unsafe { (*this.cast::<List>()).rf_x2_thin }) else { // rf-x2
             continue;
         };
         // A new host list is open; the title's next call on its list is a
@@ -718,15 +722,15 @@ fn new_list(
     tracing::debug!(kind, "command list");
     #[cfg(windows)]
     if thin::on() {
-        let mut list = boxed(kind, pipeline, true);
+        let mut list = boxed(kind, pipeline, true, false); // rf-x2
         list.thin.begin(kind, pipeline);
         return object::hand_out(LIST, list, iid, &LIST_IIDS, out);
     }
-    object::hand_out(LIST, boxed(kind, pipeline, false), iid, &LIST_IIDS, out)
+    object::hand_out(LIST, boxed(kind, pipeline, false, false), iid, &LIST_IIDS, out) // rf-x2
 }
 
 /// A list; with `thin` one whose calls are written down (it has no host list).
-fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
+fn boxed(kind: u32, pipeline: This, thin: bool, _lowered: bool) -> Box<List> { // rf-x2
     #[cfg(not(windows))]
     let _ = thin;
     let list = Box::new(List {
@@ -749,7 +753,7 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().filter(|_| !thin).and_then(|h| match h.new_list() {
+        host: crate::host::host().filter(|_| !thin).and_then(|h| match h.new_list_for(crate::rf_x2::title_origin(_lowered)) { // rf-x2
             Ok(list) => Some(list),
             Err(e) => {
                 tracing::warn!(error = %e, "no host command list");
@@ -768,6 +772,8 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
         gate: Vec::new(),
         #[cfg(windows)]
         thin: Default::default(),
+        #[cfg(windows)]
+        rf_x2_thin: _lowered, // rf-x2
     });
     #[cfg(not(windows))]
     let _ = pipeline;
@@ -1002,7 +1008,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
                 )
             };
             // SAFETY: an open list and live resources.
-            unsafe { list.list.ResourceBarrier(host) };
+            unsafe { crate::rf_x2::title_barriers(&list.list, host) }; // rf-x2
         }
     }
     0
@@ -1017,7 +1023,7 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
         crate::host::count_gpu_step(crate::host::GpuStep::OurStates, 0);
         // SAFETY: an open list and a live texture.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        unsafe { crate::rf_x2::barriers(&list.list, "vx:barrier.tex.state", &[barrier]) }; // rf-x2
     }
 }
 
@@ -1574,7 +1580,7 @@ extern "system" fn clear_rtv(
         unsafe {
             if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
                 use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-                list.list.ResourceBarrier(&[crate::host::transition(
+                crate::rf_x2::barriers(&list.list, "vx:barrier.targets", &[crate::host::transition( // rf-x2
                     texture,
                     State(before as i32),
                     State(RENDER_TARGET as i32),
@@ -1786,7 +1792,7 @@ extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size
                 // SAFETY: the same layout; no resource named.
                 let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
                 // SAFETY: an open list.
-                unsafe { list.list.ResourceBarrier(&[barrier]) };
+                unsafe { crate::rf_x2::title_barriers(&list.list, &[barrier]) }; // rf-x2
             }
         }
     }
@@ -2361,7 +2367,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
             // SAFETY: the same layout; no resource named.
             let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
             // SAFETY: an open list.
-            unsafe { list.list.ResourceBarrier(&[barrier]) };
+            unsafe { crate::rf_x2::title_barriers(&list.list, &[barrier]) }; // rf-x2
         }
     }
     #[cfg(not(windows))]
@@ -2424,7 +2430,7 @@ fn value_written(this: This, address: u64, value: u64) {
         let Some(current) = list.host.as_ref() else {
             return;
         };
-        let Some(fresh) = fresh_list() else {
+        let Some(fresh) = fresh_list(list.rf_x2_thin) else { // rf-x2
             return;
         };
         current.close();

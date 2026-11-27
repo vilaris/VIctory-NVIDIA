@@ -281,6 +281,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
+    let _rf_x2 = crate::rf_x2::range(&list.list, "vx:tex.copy"); // rf-x2
     let before = list.transition(source, COPY_SOURCE).map(|(texture, before)| {
         let state = crate::host::legal_state(texture, COPY_SOURCE);
         let barrier = crate::host::transition(
@@ -289,7 +290,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             D3D12_RESOURCE_STATES(state as i32),
         );
         // SAFETY: an open list and a live texture.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        unsafe { crate::rf_x2::barriers(&list.list, "vx:barrier.tex.state", &[barrier]) }; // rf-x2
         before
     });
     if !first && before.is_none() {
@@ -323,20 +324,17 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     // SAFETY: an open list and live resources; the buffer is as big as
     // the footprints and rests in the common state between copies.
     unsafe {
-        list.list
-            .ResourceBarrier(&[crate::host::transition(&through.buffer, common, written)]);
+        crate::rf_x2::barriers(&list.list, "vx:barrier.tex.copy", &[crate::host::transition(&through.buffer, common, written)]); // rf-x2
         for (index, (of_written, _)) in through.parts.iter().enumerate() {
             list.list
                 .CopyTextureRegion(&rows(of_written), 0, 0, 0, &part(from, index), None);
         }
-        list.list
-            .ResourceBarrier(&[crate::host::transition(&through.buffer, written, read)]);
+        crate::rf_x2::barriers(&list.list, "vx:barrier.tex.copy", &[crate::host::transition(&through.buffer, written, read)]); // rf-x2
         for (index, (_, of_read)) in through.parts.iter().enumerate() {
             list.list
                 .CopyTextureRegion(&part(to, index), 0, 0, 0, &rows(of_read), None);
         }
-        list.list
-            .ResourceBarrier(&[crate::host::transition(&through.buffer, read, common)]);
+        crate::rf_x2::barriers(&list.list, "vx:barrier.tex.copy", &[crate::host::transition(&through.buffer, read, common)]); // rf-x2
     }
     list.keep(&through.buffer);
     // A draw that also writes the source (a view of it handled before
@@ -1034,6 +1032,7 @@ impl PreludeUpload {
     /// Records the copy of the staging buffer into the host texture on
     /// `list` (the prelude), the host texture in the copy destination state.
     pub(crate) fn record(&self, list: &ID3D12GraphicsCommandList) {
+        let _rf_x2 = crate::rf_x2::range(list, "vx:tex.copy"); // rf-x2
         let texture = &self.copy.texture;
         // The staging buffer lives as long as `self.staging`, which the
         // list's steps hold until it is reset.
@@ -1071,6 +1070,7 @@ fn record_upload(
     source: &ID3D12Resource,
     base: u64,
 ) {
+    let _rf_x2 = crate::rf_x2::range(&list.list, "vx:tex.copy"); // rf-x2
     use std::sync::atomic::Ordering::Relaxed;
     const COPY_DEST: u32 = 0x400;
     // A texture cut from a block may lie where another did: what the card
@@ -1088,7 +1088,7 @@ fn record_upload(
             },
         };
         // SAFETY: an open list and a live texture.
-        unsafe { list.list.ResourceBarrier(&[aliasing]) };
+        unsafe { crate::rf_x2::barriers(&list.list, "vx:barrier.tex.alias", &[aliasing]) }; // rf-x2
     }
     crate::list::ensure_state(list, resource, COPY_DEST);
     // The staging/plane upload buffer lives until the list is reset.
@@ -1179,6 +1179,7 @@ fn fill_plane(
     }
     with_read(len, |read| {
         crate::host::copy_mapped(read.as_mut_ptr(), at as *const u8, len, false);
+        let _rf_x2 = crate::rf_x2::detile(); // rf-x2
         if let Err(error) = layout.detile(read, 0, 0, out, pitch, bytes) {
             out.fill(0);
             once!("could not copy the linear plane into the list's upload buffer: {error:?}");
@@ -1229,6 +1230,7 @@ pub(crate) fn zeros(list: &HostList, host: &crate::host::Host, texture: &ID3D12R
     let Some((buffer, data)) = list.upload(host, bytes) else {
         return;
     };
+    let _rf_x2 = crate::rf_x2::range(&list.list, "vx:tex.zero"); // rf-x2
     // SAFETY: a mapped buffer of `bytes` bytes, just made.
     unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
     for (i, footprint) in footprints.iter().enumerate() {
@@ -1281,6 +1283,7 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
     if fresh != 0
         && let Some(host) = host()
     {
+        let _rf_x2 = crate::rf_x2::range(&list.list, "vx:tex.zero"); // rf-x2
         const COPY_DEST: u32 = 0x400;
         crate::list::ensure_state(list, resource, COPY_DEST);
         // SAFETY: a live resource.
@@ -1730,6 +1733,7 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        let _rf_x2 = crate::rf_x2::detile(); // rf-x2
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step

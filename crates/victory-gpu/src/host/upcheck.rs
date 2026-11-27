@@ -178,6 +178,7 @@ pub(super) fn record(
     // SAFETY: mappings of the sizes asked for; an open list, whose compute
     // state is set whole by what follows; live buffers, the ranges in them.
     unsafe {
+        let _rf_x2 = crate::rf_x2::range(list, "vx:coh.upcheck"); // rf-x2
         std::ptr::write_bytes(answers, 0, size as usize);
         list.SetComputeRootSignature(&pass.root);
         list.SetPipelineState(&pass.pso);
@@ -201,7 +202,7 @@ pub(super) fn record(
             .filter(|(s, _)| seen.insert(std::sync::Arc::as_ptr(s) as usize))
             .map(|(s, _)| transition(&s.buffer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST))
             .collect();
-        list.ResourceBarrier(&done);
+        crate::rf_x2::barriers(list, "vx:barrier.coh.send", &done); // rf-x2
     }
     Some(Looks {
         found: (found, answers as usize),

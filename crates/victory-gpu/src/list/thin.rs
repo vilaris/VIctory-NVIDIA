@@ -337,7 +337,7 @@ fn back_list(kind: u32) -> This {
         unsafe { (*(back as *mut List)).kind = kind };
         return back as This;
     }
-    let list: This = Box::into_raw(super::boxed(kind, std::ptr::null(), false)).cast_const().cast();
+    let list: This = Box::into_raw(super::boxed(kind, std::ptr::null(), false, true)).cast_const().cast(); // rf-x2
     super::close(list);
     list
 }

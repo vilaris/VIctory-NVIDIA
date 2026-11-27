@@ -88,6 +88,8 @@ pub mod queue;
 pub mod replay;
 #[cfg(windows)]
 mod residency;
+#[cfg(windows)]
+mod rf_x2; // rf-x2
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
