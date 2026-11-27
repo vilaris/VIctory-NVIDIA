@@ -10749,7 +10749,9 @@ impl Meter {
                     crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
                 );
                 // What the queue's room test (`crate::resource::room`) weighs.
-                crate::resource::log_room(host().and_then(|h| h.video_memory()));
+                let memory = host().and_then(|h| h.video_memory()); // rf-x1
+                crate::resource::log_room(memory); // rf-x1
+                crate::resource::rf_x1::log(memory); // rf-x1
                 let [looks, mapped, same, staged, all, made, views] =
                     [0, 1, 2, 3, 4, 5, 6].map(|i| crate::draw::HEAP_TEXTURE_NANOS[i].swap(0, Ordering::Relaxed) / 1_000_000);
                 let rest = all.saturating_sub(looks + mapped + same + staged + made + views);
