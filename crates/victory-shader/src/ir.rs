@@ -777,7 +777,16 @@ pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
 /// the join may have other ways in (an inner branch that ends together with an outer one).
 /// That leaves out most of the skips of the title's large lighting programs, whose bodies
 /// are then code every lane runs.
-pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
+///
+/// `loops_kept` keeps a skip around a loop that goes round on a scalar test (`s_cmp_*`, not a
+/// lane mask). With no lane left the console does not run such a loop; walked with EXEC
+/// clear, its bounds are whatever a first-lane read found in the registers of lanes that
+/// never wrote them, and it goes round until the iteration limit, where every thread of the
+/// group leaves the program (the water's tiled light: the loop over a tile's slices, whose
+/// ends the tile's farthest lane gives; a tile without that lane stored nothing at all, at
+/// 4,096 rounds of group barriers). The kept skip is a branch the wave takes together
+/// (`emit::widen`), as on the console.
+pub(crate) fn without_skips(p: &Program, deep: bool, loops_kept: bool) -> Option<Program> {
     let n = p.blocks.len();
     let ends = |b: usize| {
         p.blocks[b].exit == Exit::End
@@ -858,6 +867,41 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         for x in (0..n).filter(|&x| inside[x]) {
             if p.blocks[x].preds.iter().any(|&q| q != b && !inside[q]) {
                 return None;
+            }
+        }
+        // a loop in the region that goes round on a scalar test
+        if loops_kept {
+            for x in (0..n).filter(|&x| inside[x]) {
+                let Some(last) = p.blocks[x].insts.last() else {
+                    continue;
+                };
+                if !matches!(last.name(), "s_cbranch_scc0" | "s_cbranch_scc1") {
+                    continue;
+                }
+                let scalar = last.read(Reg::Scc).is_none_or(|scc| {
+                    p.blocks
+                        .iter()
+                        .flat_map(|b| &b.insts)
+                        .find(|i| i.writes.iter().any(|w| w.1 == scc))
+                        .is_none_or(|i| i.name().starts_with("s_cmp_") || i.name().starts_with("s_bitcmp"))
+                });
+                // (round: the branch leads back to its own block inside the region)
+                let mut seen = vec![false; n];
+                let mut stack = p.blocks[x].exit.successors();
+                let mut round = false;
+                while let Some(y) = stack.pop() {
+                    if y == x {
+                        round = true;
+                        break;
+                    }
+                    if y >= n || !inside[y] || std::mem::replace(&mut seen[y], true) {
+                        continue;
+                    }
+                    stack.extend(p.blocks[y].exit.successors());
+                }
+                if scalar && round {
+                    return None;
+                }
             }
         }
         // the join sees no scalar the region changed
@@ -1746,22 +1790,22 @@ mod tests {
         // s6 is changed in the body and read after the join: the branch stays
         let kept = skip(&[SET, USE], &[READ]);
         assert_eq!(skips(&kept), 1);
-        assert!(without_skips(&kept, false).is_none());
-        assert!(without_skips(&kept, true).is_none());
+        assert!(without_skips(&kept, false, false).is_none());
+        assert!(without_skips(&kept, true, false).is_none());
         // ... put back by a copy of what it held (as a scalar parked in a VGPR lane comes
         // back): every lane may walk the body
         let back = skip(&[SET, USE, BACK], &[READ]);
-        assert!(without_skips(&back, false).is_none());
-        assert_eq!(skips(&without_skips(&back, true).expect("left out")), 0);
+        assert!(without_skips(&back, false, false).is_none());
+        assert_eq!(skips(&without_skips(&back, true, false).expect("left out")), 0);
         // ... or not read after the join at all
         let unread = skip(&[SET, USE], &[]);
-        assert_eq!(skips(&without_skips(&unread, false).expect("left out")), 0);
-        assert_eq!(skips(&without_skips(&unread, true).expect("left out")), 0);
+        assert_eq!(skips(&without_skips(&unread, false, false).expect("left out")), 0);
+        assert_eq!(skips(&without_skips(&unread, true, false).expect("left out")), 0);
         // ... or read only by a restore of EXEC that nothing uses before the next one
         // (s_mov_b64 exec, s[6:7]; s_mov_b64 exec, s[12:13]; v_mov_b32 v2, s0)
         let idle = skip(&[SET, USE], &[0xBEFE_0406, 0xBEFE_040C, 0x7E04_0200]);
-        assert!(without_skips(&idle, false).is_none());
-        assert_eq!(skips(&without_skips(&idle, true).expect("left out")), 0);
+        assert!(without_skips(&idle, false, false).is_none());
+        assert_eq!(skips(&without_skips(&idle, true, false).expect("left out")), 0);
     }
 
     #[test]
