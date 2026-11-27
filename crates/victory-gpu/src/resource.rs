@@ -18,6 +18,10 @@ use crate::object::{
     guid,
 };
 
+#[cfg(windows)]
+#[path = "rf_x1.rs"]
+pub(crate) mod rf_x1;
+
 /// The interfaces every device child also answers for.
 pub(crate) const PAGEABLE_IIDS: [Iid; 3] = [
     guid(
@@ -1267,6 +1271,7 @@ pub(crate) struct HostTexture {
     /// The texture's flags (asked once: the runtime takes 100 ns to say, and
     /// every texture of every draw is asked about).
     flags: u32,
+    rf_x1_footprint: Option<rf_x1::TextureFootprint>,
 }
 
 /// What a host copy was filled with last: the first level of it and the
@@ -1750,6 +1755,10 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             None => HostTexture::new(texture, state),
         };
         host.base = base;
+        if rf_x1::enabled() {
+            let guest = footprint(&r.desc).map(|f| f.size);
+            host.rf_x1_footprint = Some(rf_x1::TextureFootprint::new(guest, host.bytes));
+        }
         host.grown.store(r.host.grown.swap(false, Relaxed), Relaxed);
         if base > 0 {
             HELD[0].fetch_add(1, Relaxed);
@@ -1831,18 +1840,29 @@ fn filled_texture_bytes() -> u64 {
     KINDS[1].load(std::sync::atomic::Ordering::Relaxed) + crate::tiles::given_total()
 }
 
-/// Admission for copies of textures picked by index. An explicit
-/// `VICTORY_TEXTURE_BUDGET_MB` limits their bytes directly. Otherwise,
-/// the texture floor and the DXGI budget determine admission.
+/// Device-local texture allocations, including backing tiles but excluding free pool space.
+#[cfg(windows)]
+pub(crate) fn rf_x1_texture_bytes(tiled: u64) -> [u64; 2] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [HOST_TEXTURES[1].load(Relaxed) + tiled, KINDS[1].load(Relaxed) + tiled]
+}
+
+/// Admission for copies of textures picked by index. RF X1 applies the
+/// weighted DXGI limit even below the texture floor or with an explicit
+/// `VICTORY_TEXTURE_BUDGET_MB` cap.
 #[cfg(windows)]
 pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     const WITHOUT_BUDGET: u64 = 4 << 30;
     let filled = filled_texture_bytes();
-    if let Some(limit) = texture_budget_limit() {
+    let limit = texture_budget_limit();
+    let priority = rf_x1::reserve_total() > 0;
+    if let Some(limit) = limit
+        && (!priority || filled >= limit)
+    {
         return filled < limit;
     }
     let floor = texture_floor_bytes(memory.map(|[budget, ..]| budget));
-    if filled < floor {
+    if !priority && filled < floor {
         return true;
     }
     match memory {
@@ -1850,7 +1870,10 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
             let weights = RoomWeights::new(budget, used);
             weights.weighed() < weights.line
         }
-        None => filled < WITHOUT_BUDGET,
+        None => {
+            let kept = if priority { rf_x1::reserve_unused() } else { 0 };
+            filled < WITHOUT_BUDGET.saturating_sub(kept)
+        }
     }
 }
 
@@ -1990,6 +2013,7 @@ impl RoomWeights {
             used,
             free_in_blocks,
             credit,
+            // Keep the title's unused buffer and window reserve beside the target reserve.
             buffers: crate::shadow::card_room_kept(),
             targets: targets_room_kept(),
             line: room_line(budget),
@@ -1997,7 +2021,7 @@ impl RoomWeights {
     }
 
     fn weighed(&self) -> u64 {
-        self.used.saturating_sub(self.credit) + self.buffers + self.targets
+        self.used.saturating_sub(self.credit).saturating_add(self.buffers).saturating_add(self.targets)
     }
 }
 
@@ -2005,17 +2029,22 @@ impl RoomWeights {
 #[cfg(windows)]
 pub(crate) fn log_room(memory: Option<[u64; 4]>) {
     let Some([budget, used, ..]) = memory else { return };
-    if texture_budget_limit().is_some() {
+    let limit = texture_budget_limit();
+    let priority = rf_x1::reserve_total() > 0;
+    if limit.is_some() && !priority {
         return;
     }
     let weights = RoomWeights::new(budget, used);
     let weighed = weights.weighed();
-    let below_floor = filled_texture_bytes() < texture_floor_bytes(Some(budget));
-    let verdict = match (below_floor, weighed < weights.line) {
-        (true, _) => "room (below the texture floor)",
-        (false, true) => "room",
-        (false, false) => "no room, new textures wait",
+    let filled = filled_texture_bytes();
+    let below_floor = !priority && filled < texture_floor_bytes(Some(budget));
+    let verdict = match (limit.is_some_and(|limit| filled >= limit), below_floor, weighed < weights.line) {
+        (true, _, _) => "no room, explicit texture limit reached",
+        (false, true, _) => "room (below the texture floor)",
+        (false, false, true) => "room",
+        (false, false, false) => "no room, new textures wait",
     };
+    let kept_for = if priority { "title buffers and windows" } else { "card copies of title buffers" };
     let [budget, used, free, credit, buffers, targets, weighed, line] = [
         budget, used, weights.free_in_blocks, weights.credit, weights.buffers, weights.targets, weighed, weights.line,
     ]
@@ -2023,7 +2052,7 @@ pub(crate) fn log_room(memory: Option<[u64; 4]>) {
     tracing::info!(
         target: "victory_gpu::host",
         "the texture queue's room: {used} MB in use - {credit} MB texture block credit (of {free} MB free) + \
-         {buffers} MB kept for card copies of title buffers + {targets} MB kept for render targets = {weighed} MB \
+         {buffers} MB kept for {kept_for} + {targets} MB kept for render targets = {weighed} MB \
          against a line of {line} MB ({:.1} % of a budget of {budget} MB): {verdict}",
         line as f64 * 100.0 / budget.max(1) as f64
     );
@@ -2893,6 +2922,7 @@ impl HostTexture {
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
             flags,
+            rf_x1_footprint: None,
         }
     }
 
@@ -2918,6 +2948,7 @@ impl HostTexture {
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
             flags,
+            rf_x1_footprint: None,
         }
     }
 }
@@ -5267,6 +5298,25 @@ float4 lit() : SV_Target { return 1.0; }
         // 6 GB: 88 % floor (768 MiB would leave 87.2 %).
         assert_eq!(line_for(6_000 * MIB), 6_000 * MIB / 100 * 88);
         assert_eq!(line_for(0), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rf_x1_charges_only_the_unused_reserve_to_the_texture_queue() {
+        const MIB: u64 = 1 << 20;
+        let mut weights = RoomWeights {
+            used: 4800 * MIB,
+            free_in_blocks: 256 * MIB,
+            credit: 256 * MIB,
+            buffers: 3072 * MIB,
+            targets: 512 * MIB,
+            line: 8000 * MIB,
+        };
+        assert!(weights.weighed() >= weights.line);
+        // A newly placed window has its bytes counted by DXGI instead.
+        weights.used += 512 * MIB;
+        weights.buffers -= 512 * MIB;
+        assert_eq!(weights.weighed(), 8128 * MIB);
     }
 
     /// The room kept for render targets goes once the world's targets are

@@ -23,6 +23,7 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
 use crate::host::memory_samples::Kind;
 use crate::host::{HostList, host};
+use crate::resource::rf_x1::{self, Reservation, ShadowKind};
 use crate::watch::PAGE;
 
 /// A title buffer's host copy.
@@ -122,6 +123,7 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    rf_x1_allocation: Option<rf_x1::ShadowAllocation>,
 }
 
 const CLEAN_SLOTS: usize = 4;
@@ -357,7 +359,7 @@ static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// and the room of a copy turned down is given up ([`CARD_REFUSED`]).
 fn card_room_kept_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_ROOM_FOR_BUFFERS").is_none_or(|v| v != "0"))
+    rf_x1::priority() || *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_ROOM_FOR_BUFFERS").is_none_or(|v| v != "0"))
 }
 
 /// Title buffers big enough for a copy in the card's memory that were
@@ -372,6 +374,9 @@ static CARD_REFUSED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 pub(crate) fn card_room_kept() -> u64 {
     if !card_room_kept_on() || !cards() {
         return 0;
+    }
+    if rf_x1::priority() {
+        return rf_x1::reserve_unused();
     }
     // Not more than such copies came to in any session, whatever they may
     // come to: on a card of 24 GB a quarter of its budget was kept for them,
@@ -441,13 +446,43 @@ pub(crate) fn card_hash_bytes(size: u64) -> u64 {
     (size / PIECE as u64 + 2) * 16
 }
 
+struct CardSide {
+    buffer: ID3D12Resource,
+    local: bool,
+    reservation: Option<Reservation<'static>>,
+}
+
+fn priority_card_for(size: u64, kind: ShadowKind, live: &AtomicU64) -> Option<CardSide> {
+    let host = host()?;
+    if !cards() || !host.card_ready() {
+        return None;
+    }
+    let Some(reservation) = rf_x1::reserve(size, host.video_memory()) else {
+        rf_x1::refused(kind, false);
+        return None;
+    };
+    let Some(buffer) = host.uav_buffer_for(size, Kind::UavShadow) else {
+        rf_x1::refused(kind, true);
+        return None;
+    };
+    live.fetch_add(size, Ordering::Relaxed);
+    Some(CardSide { buffer, local: true, reservation: Some(reservation) })
+}
+
 /// A buffer of `size` bytes in the card's memory for a title buffer's
 /// copy, if the copy is to be there: [`cards`] is on, the size is within
-/// [`card_limits`] and below 1 GiB (the compare counts in 32 bits), and the
-/// host has what it takes (`Host::card_ready`).
-fn card_for(size: u64) -> Option<ID3D12Resource> {
-    let there = card_room_for(size);
-    if there.is_some() || !card_all() || size >= 1 << 30 {
+/// [`card_limits`] or the experiment's reservation, below 1 GiB (the compare
+/// counts in 32 bits), and the host has what it takes (`Host::card_ready`).
+fn card_for(size: u64) -> Option<CardSide> {
+    if size >= 1 << 30 {
+        return None;
+    }
+    let there = if rf_x1::priority() {
+        priority_card_for(size, ShadowKind::Buffer, &CARD_BYTES[0])
+    } else {
+        card_room_for(size).map(|buffer| CardSide { buffer, local: true, reservation: None })
+    };
+    if there.is_some() || !card_all() {
         return there;
     }
     // Two sides all the same, the card's in the PC's memory.
@@ -457,7 +492,7 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     }
     let (buffer, _) = host.shared_buffer(size)?;
     CARD_BYTES[0].fetch_add(size, Ordering::Relaxed);
-    Some(buffer)
+    Some(CardSide { buffer, local: false, reservation: None })
 }
 
 /// Whether every title buffer's copy has two sides, however small
@@ -500,6 +535,7 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 100 * hundredths
     {
+        rf_x1::refused(ShadowKind::Buffer, false);
         // Said, with the numbers it was decided by: run 193 made 31 copies
         // of 95 and no line named the others. The first 64, then every
         // 32nd.
@@ -524,11 +560,13 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     }
     if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        rf_x1::refused(ShadowKind::Buffer, false);
         return None;
     }
     let buffer = host.uav_buffer_for(size, Kind::UavShadow);
     if buffer.is_none() {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        rf_x1::refused(ShadowKind::Buffer, true);
     }
     buffer
 }
@@ -582,8 +620,12 @@ static WINDOW_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// A buffer in the card's memory for a window of `size` bytes, if it is to
 /// be there ([`window_card_most`]).
-fn window_card_for(size: u64) -> Option<ID3D12Resource> {
-    let there = window_room_for(size);
+fn window_card_for(size: u64) -> Option<CardSide> {
+    let there = if rf_x1::priority() {
+        priority_card_for(size, ShadowKind::Window, &WINDOW_CARD_BYTES)
+    } else {
+        window_room_for(size).map(|buffer| CardSide { buffer, local: true, reservation: None })
+    };
     if there.is_some() || !windows_own() || !cards() {
         return there;
     }
@@ -594,7 +636,7 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
     }
     let (buffer, _) = host.shared_buffer(size)?;
     WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed);
-    Some(buffer)
+    Some(CardSide { buffer, local: false, reservation: None })
 }
 
 /// The most bytes of windows outside buffers that lie in the card's memory
@@ -620,17 +662,21 @@ static WINDOW_MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// A buffer for a window of `size` bytes in card memory the CPU maps, if it is
 /// to be there ([`window_mapped_most`]).
-fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8, Option<Reservation<'static>>)> {
     let most = window_mapped_most();
     if most == 0 {
         return None;
     }
     let host = host()?;
-    if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
-    {
-        return None;
-    }
+    let memory = host.video_memory();
+    let reservation = if rf_x1::priority() && cards() {
+        Some(rf_x1::reserve(size, memory)?)
+    } else {
+        if memory.is_some_and(|[budget, used, ..]| used + size > budget / 10 * 8) {
+            return None;
+        }
+        None
+    };
     if WINDOW_MAPPED_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
         WINDOW_MAPPED_BYTES.fetch_sub(size, Ordering::Relaxed);
         return None;
@@ -639,7 +685,7 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
     if made.is_none() {
         WINDOW_MAPPED_BYTES.fetch_sub(size, Ordering::Relaxed);
     }
-    made
+    made.map(|(buffer, data)| (buffer, data, reservation))
 }
 
 /// Whether windows outside buffers have two sides too, so that submissions
@@ -665,15 +711,18 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 10 * 8
     {
+        rf_x1::refused(ShadowKind::Window, false);
         return None;
     }
     if WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
+        rf_x1::refused(ShadowKind::Window, false);
         return None;
     }
     let buffer = host.uav_buffer_for(size, Kind::UavShadow);
     if buffer.is_none() {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
+        rf_x1::refused(ShadowKind::Window, true);
     }
     buffer
 }
@@ -2562,26 +2611,33 @@ fn wc_bar() -> bool {
 
 /// A buffer of `size` bytes in card memory the CPU maps, for [`wc_bar`],
 /// counted with the card sides of copies ([`card_limits`]).
-fn wc_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-    let (_, most) = card_limits();
+fn wc_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8, Option<Reservation<'static>>)> {
     if size >= 1 << 30 {
         return None;
     }
     let host = host()?;
-    if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
-    {
-        return None;
-    }
-    if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
-        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
-        return None;
-    }
+    let reservation = if rf_x1::priority() && cards() {
+        let reservation = rf_x1::reserve(size, host.video_memory())?;
+        CARD_BYTES[0].fetch_add(size, Ordering::Relaxed);
+        Some(reservation)
+    } else {
+        let (_, most) = card_limits();
+        if let Some([budget, used, ..]) = host.video_memory()
+            && used + size > budget / 10 * 8
+        {
+            return None;
+        }
+        if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
+            CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+            return None;
+        }
+        None
+    };
     let made = host.mapped_card_buffer(size, true);
     if made.is_none() {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
     }
-    made
+    made.map(|(buffer, data)| (buffer, data, reservation))
 }
 
 /// Whether a refresh of a copy in the card's memory takes, and sends up,
@@ -4014,7 +4070,12 @@ impl Shadow {
             wc: AtomicU8::new(0),
             mapped: false,
             place: None,
+            rf_x1_allocation: None,
         }
+    }
+
+    fn track_rf_x1(&mut self, kind: ShadowKind, local: bool, size: u64, reservation: Option<Reservation<'static>>) {
+        self.rf_x1_allocation = rf_x1::ShadowAllocation::new(kind, local, size, reservation);
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -6382,7 +6443,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // shaders write stays there ([`wc_bar`]).
         if wc_bar()
             && is_write_combined(key.0, len)
-            && let Some((buffer, data)) = wc_mapped_for(size)
+            && let Some((buffer, data, reservation)) = wc_mapped_for(size)
         {
             crate::host::name(&buffer, || {
                 format!("title buffer {:#x}+{len:#x} mapped on the card", key.0)
@@ -6397,6 +6458,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
             shadow.mapped = true;
             *shadow.wc.get_mut() = 2;
+            shadow.track_rf_x1(ShadowKind::Buffer, true, size, reservation);
             entry.shadow = Some(Arc::new(shadow));
             return entry.shadow.clone();
         }
@@ -6404,18 +6466,18 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
-            Some(on_card) => {
-                crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
+        let (buffer, card, local, reservation) = match card_for(size) {
+            Some(side) => {
+                crate::host::name(&side.buffer, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(
                     start = format_args!("{:#x}", key.0),
                     len,
                     "a buffer's host copy is in the card's memory"
                 );
                 let card = Card::new(buffer, size);
-                (on_card, Some(card))
+                (side.buffer, Some(card), side.local, side.reservation)
             }
-            None => (buffer, None),
+            None => (buffer, None, false, None),
         };
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -6434,6 +6496,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         }
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
         shadow.card = card;
+        shadow.track_rf_x1(ShadowKind::Buffer, local, size, reservation);
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
             carded(&shadow);
@@ -6696,13 +6759,14 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         return Some(shadow);
     }
     // One buffer in the card's memory, filled by the CPU through the bus.
-    if let Some((buffer, data)) = window_mapped_for(len) {
+    if let Some((buffer, data, reservation)) = window_mapped_for(len) {
         crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} mapped on the card"));
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
         let mut shadow = Shadow::new(buffer, data, gpu, start, len);
         shadow.window = true;
         shadow.mapped = true;
+        shadow.track_rf_x1(ShadowKind::Window, true, len, reservation);
         let shadow = Arc::new(shadow);
         note(&shadow);
         map.insert((start, len), shadow.clone());
@@ -6712,13 +6776,13 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
     // buffer there, and the one just made is the CPU's side.
-    let (buffer, card) = match window_card_for(len) {
-        Some(on_card) => {
-            crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
+    let (buffer, card, local, reservation) = match window_card_for(len) {
+        Some(side) => {
+            crate::host::name(&side.buffer, || format!("title memory {start:#x}+{len:#x} on the card"));
             let card = Card::new(buffer, len);
-            (on_card, Some(card))
+            (side.buffer, Some(card), side.local, side.reservation)
         }
-        None => (buffer, None),
+        None => (buffer, None, false, None),
     };
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -6730,6 +6794,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
     shadow.card = card;
+    shadow.track_rf_x1(ShadowKind::Window, local, len, reservation);
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {
         carded(&shadow);
@@ -6790,11 +6855,14 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
             Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
         });
     }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    let size = len.next_multiple_of(256);
+    let (buffer, data) = host()?.shared_buffer(size)?;
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+    let mut shadow = Shadow::new(buffer, data, gpu, address, len);
+    shadow.track_rf_x1(ShadowKind::Buffer, false, size, None);
+    let shadow = Arc::new(shadow);
     map.insert((address, len), (shadow.clone(), now));
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     OWN_MADE.fetch_add(1, Ordering::Relaxed);
