@@ -277,7 +277,8 @@ pub(super) fn record(
     // SAFETY: an open list; our root signature and pipeline; live buffers:
     // the sources and the table are read in the common state (promoted).
     unsafe {
-        l.ResourceBarrier(&[
+        let _rf_x2 = crate::rf_x2::range(l, "vx:indirect.clamp.batch"); // rf-x2
+        crate::rf_x2::barriers(l, "vx:barrier.indirect", &[ // rf-x2
             uav_barrier(),
             transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         ]);
@@ -292,6 +293,6 @@ pub(super) fn record(
         l.Dispatch(JOBS.div_ceil(64), 1, 1);
         // Nothing else the pass writes is read before the next full wait
         // (the budget, by the next pass): only the records have to be there.
-        l.ResourceBarrier(&[after]);
+        crate::rf_x2::barriers(l, "vx:barrier.indirect", &[after]); // rf-x2
     }
 }

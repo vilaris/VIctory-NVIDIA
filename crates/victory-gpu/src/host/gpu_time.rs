@@ -882,7 +882,7 @@ mod tests {
     fn detailed_gpu_timing_resolves_more_than_one_query_block() {
         let Some(host) = host() else { return };
         let Some(ring) = ring() else { return };
-        let list = host.make_list().unwrap();
+        let list = host.make_list(crate::rf_x2::Origin::Coherence).unwrap(); // rf-x2
         let name = INTERNED.intern("query block regression test");
         let slots: Vec<_> = {
             let mut state = list.gpu_time.state.lock().unwrap();

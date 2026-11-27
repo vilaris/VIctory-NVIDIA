@@ -138,6 +138,7 @@ impl Composer {
             self.views.push(heap);
         }
         let views = &self.views[slot];
+        let _rf_x2 = crate::rf_x2::range(list, "vx:present.compose"); // rf-x2
         // SAFETY: an open list; the views are made in slots no frame in flight
         // reads; live textures.
         unsafe {

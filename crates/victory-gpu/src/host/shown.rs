@@ -107,6 +107,7 @@ unsafe fn run_on(
                 render_trace::execute(queue, &lists[from..to], signal.map(|(fence, value)| (fence.as_raw() as usize, value)));
             }
             // SAFETY: the caller's.
+            crate::rf_x2::submitted(&lists[from..to]); // rf-x2
             unsafe { queue.ExecuteCommandLists(&lists[from..to]) };
         }
         from = to;

@@ -383,6 +383,7 @@ pub(crate) struct HostPipeline {
     /// A mesh pipeline (graphics without vertex input).
     pub(crate) mesh: bool,
     pub(crate) pso: ID3D12PipelineState,
+    pub(crate) rf_x2_key: Option<u64>, // rf-x2
     pub(crate) root: ID3D12RootSignature,
     /// Vertex, then pixel stage, or the compute stage.
     pub(crate) stages: Vec<Stage>,
@@ -650,6 +651,7 @@ impl HostPipeline {
                 compute: true,
                 mesh: false,
                 pso,
+                rf_x2_key: crate::rf_x2::pipeline_key(&name), // rf-x2
                 root,
                 stages: bound,
                 name: format!("{shaders:?}"),
@@ -703,6 +705,7 @@ impl HostPipeline {
                 compute: false,
                 mesh: true,
                 pso,
+                rf_x2_key: crate::rf_x2::pipeline_key(&name), // rf-x2
                 root,
                 stages: bound,
                 name: format!("{shaders:?}"),
@@ -786,14 +789,16 @@ impl HostPipeline {
                 || unsafe { host.device.CreateGraphicsPipelineState(desc) },
             )
         };
-        let mut made = make(&desc, &name(rect_gs.as_ref()));
+        let mut key = name(rect_gs.as_ref()); // rf-x2
+        let mut made = make(&desc, &key); // rf-x2
         if made.is_err() && rect_gs.is_some() {
             // The host refused the geometry stage: once more without it.
             tracing::warn!(?shaders, "host pipeline refused with the rectangle geometry stage");
             host.log_messages();
             desc.GS = D3D12_SHADER_BYTECODE::default();
             rect_gs = None;
-            made = make(&desc, &name(None));
+            key = name(None); // rf-x2
+            made = make(&desc, &key); // rf-x2
         }
         let pso = match made {
             Ok(pso) => pso,
@@ -819,6 +824,7 @@ impl HostPipeline {
             compute: false,
             mesh: false,
             pso,
+            rf_x2_key: crate::rf_x2::pipeline_key(&key), // rf-x2
             root,
             stages: bound,
             name: format!("{shaders:?}"),

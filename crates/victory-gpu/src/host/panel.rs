@@ -274,7 +274,7 @@ impl Buffers {
         unsafe {
             if std::mem::take(&mut self.fresh) {
                 list.CopyResource(&self.card, &self.uploads[self.turn].0);
-                list.ResourceBarrier(&[transition(&self.card, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                crate::rf_x2::barriers(list, "vx:barrier.present", &[transition(&self.card, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]); // rf-x2
             }
             let from = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: std::mem::transmute_copy(&self.card),

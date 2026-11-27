@@ -224,6 +224,8 @@ pub(crate) extern "system" fn wait(
     if origin && (hr == S_OK || flags & TOKEN_ON_TIMEOUT != 0) {
         // Tokens count frames (consecutive), not ticks.
         let frame = FRAME.fetch_add(1, Ordering::Relaxed) + 1;
+        #[cfg(windows)]
+        crate::rf_x2::frame(frame); // rf-x2
         pace::begun();
         if !token.is_null() {
             // SAFETY: checked non-null; the title passes its token.

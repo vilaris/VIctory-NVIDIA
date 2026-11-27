@@ -252,8 +252,9 @@ pub(super) unsafe fn record(
     unsafe { (memory.1 as *mut u32).write_volatile(0) };
     // SAFETY: the caller's.
     unsafe {
+        let _rf_x2 = crate::rf_x2::range(list, "vx:prefetch"); // rf-x2
         // What the compare wrote, first.
-        list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+        crate::rf_x2::barriers(list, "vx:barrier.prefetch", &[D3D12_RESOURCE_BARRIER { // rf-x2
             Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
             Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
             Anonymous: D3D12_RESOURCE_BARRIER_0 {
