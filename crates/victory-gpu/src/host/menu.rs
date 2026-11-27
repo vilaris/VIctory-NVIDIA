@@ -49,6 +49,13 @@ const ABOUT_PRELOAD: [&str; 3] = [
     "TAKES A WHILE: MAYBE A LONG TIME, DEPENDING ON HARDWARE.",
     "A LATER UPDATE OF THIS BUILD MAY NEED A NEW PRELOAD.",
 ];
+/// The setting that turns MFG Unlocker on, and what is said of it while it is picked.
+const MFG: &str = "VICTORY_MFG_UNLOCKER";
+const ABOUT_MFG: [&str; 3] = [
+    "A MOD, NOT OURS: DLSS FRAME GEN ON RTX 20 AND 30 CARDS.",
+    "ON: DOWNLOADED FROM ITS GITHUB AT THE NEXT START, THEN RUN.",
+    "NVIDIA DOES NOT SUPPORT IT. IF THE GAME FAILS, TURN IT OFF.",
+];
 /// The note after the first Enter on it: the second one does it.
 const CONFIRM_PRELOAD: &str = "ENTER AGAIN: SAVE, CLOSE THE GAME AND PRELOAD";
 /// The last line of the box: where this build comes from.
@@ -77,6 +84,8 @@ const ITEMS: &[Item] = &[
     Item { var: "VICTORY_MENU_FRAMEGEN", label: "FRAME GENERATION", values: &[("0", "OFF"), ("2", "2X"), ("3", "3X"), ("4", "4X"), ("5", "5X"), ("6", "6X (MOST)")], live: false },
     // DLSS Frame Generation where it runs (RTX 40 and later), else AMD's FSR 3 (2X only).
     Item { var: "VICTORY_MENU_FG_TYPE", label: "FRAME GEN TYPE", values: &[("auto", "AUTO"), ("dlss", "DLSS"), ("fsr", "FSR 3 (OLDER CARDS)")], live: false },
+    // Someone else's mod (apps\victory\src\play.rs): downloaded at the next start, then loaded.
+    Item { var: MFG, label: "MFG UNLOCKER (MOD, RTX 20/30)", values: UNSET_ON, live: false },
     Item { var: "VICTORY_MENU_FPS", label: "FRAME RATE CAP", values: &[("1000", "NONE"), ("120", "120"), ("60", "60"), ("30", "30 (THE GAME)")], live: false },
     Item { var: "VICTORY_FPS_LINE", label: "FPS AT THE TOP", values: &[("1", "ON"), ("0", "OFF")], live: true },
     Item { var: "VICTORY_PANEL", label: "STATS PANEL (F3)", values: &[("0", "OFF"), ("1", "ON")], live: true },
@@ -107,6 +116,28 @@ const ACTIONS: [&str; 5] =
 
 fn get(var: &str) -> String {
     std::env::var(var).unwrap_or_default()
+}
+
+/// The first start of a new victory.exe: the seconds it plays before it starts
+/// again by itself (`VICTORY_WARMUP_RESTART`, set by the launcher while the exe
+/// has no mark under `%LOCALAPPDATA%\victory\warmed`). On the RTX 5070, every
+/// new build's first run stayed at a flat 14 fps (Present ~40 ms) for as long as
+/// it ran, and every later run was normal (27-29 fps), even after a first run of
+/// 45 seconds; a copy of an exe already run was fast at once (2026-11-27). Likely
+/// the driver's cache of the program; not ours to fix, so it is run through once.
+pub(crate) fn warmup_seconds() -> Option<u64> {
+    get("VICTORY_WARMUP_RESTART").parse().ok().filter(|s| *s > 0)
+}
+
+/// The start's notice lines for the warm-up start ([`warmup_seconds`]).
+pub(crate) fn warmup_notice(seconds: u64) -> Vec<String> {
+    vec![
+        "FIRST START OF THIS VERSION: A ONE-TIME WARM-UP".to_owned(),
+        format!("THE GAME RESTARTS BY ITSELF IN ABOUT {seconds} SECONDS"),
+        "THIS HAPPENS ONCE PER NEW VERSION, AND IS NEEDED:".to_owned(),
+        "WITHOUT IT THE FIRST RUN STAYS AT ABOUT 14 FPS".to_owned(),
+        String::new(),
+    ]
 }
 
 /// Starts `command_line` in a console window of its own, with that console's input and output.
@@ -372,7 +403,13 @@ impl Menu {
             out.push(String::new());
         }
         out.push(String::new());
-        let about = if self.at == ITEMS.len() + PRELOAD { ABOUT_PRELOAD } else { [""; 3] };
+        let about = if self.at == ITEMS.len() + PRELOAD {
+            ABOUT_PRELOAD
+        } else if ITEMS.get(self.at).is_some_and(|i| i.var == MFG) {
+            ABOUT_MFG
+        } else {
+            [""; 3]
+        };
         out.extend(about.iter().map(|l| (*l).to_owned()));
         out.push(if self.note.is_empty() { "* = CHANGED: APPLIES AT THE NEXT START UNLESS LIVE".to_owned() } else { self.note.clone() });
         out.push(REPO.to_owned());
@@ -453,7 +490,7 @@ impl Menu {
     }
 
     /// Starts the launcher again in a new console, a few seconds on, and ends this run.
-    /// `preload`: the launcher makes every shader first (its `-Preload`, for that start alone).
+    /// `preload`: the launcher makes every shader first (`VICTORY_PRELOAD=1`, for that start alone).
     fn restart(&mut self, preload: bool) {
         let Some(play) = std::env::var_os("VICTORY_MENU_PLAY") else {
             self.note = "SAVED. START THE LAUNCHER AGAIN YOURSELF".to_owned();
@@ -461,7 +498,14 @@ impl Menu {
         };
         let play = play.to_string_lossy().replace('\'', "''");
         let args = get("VICTORY_MENU_ARGS");
-        let command = format!("Start-Sleep 3; & '{play}' {args}{}", if preload { " -Preload" } else { "" });
+        // The preload is asked by VICTORY_PRELOAD=1, which both launchers read (victory.exe's is
+        // `--preload`, the script's `-Preload`: the script's flag given to victory.exe was refused,
+        // and the window closed before it could be read, 2026-11-27). A launcher that fails keeps
+        // its window until Enter.
+        let command = format!(
+            "Start-Sleep 3; {}& '{play}' {args}; if ($LASTEXITCODE) {{ Read-Host 'The start failed (see above). Press Enter to close this window' }}",
+            if preload { "$env:VICTORY_PRELOAD='1'; " } else { "" }
+        );
         match new_console(&format!("powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"{}\"", command.replace('"', "\\\""))) {
             Ok(()) => {
                 tracing::info!(command, preload, "settings menu: restarting");
@@ -481,6 +525,30 @@ impl Menu {
         }
     }
 
+    /// The warm-up start ([`warmup_seconds`]): once its time is up, this exe is
+    /// marked as warmed up (`VICTORY_WARMUP_MARK`) and the game starts again.
+    fn warmup(&mut self) {
+        static BEGAN: OnceLock<std::time::Instant> = OnceLock::new();
+        static DONE: AtomicBool = AtomicBool::new(false);
+        let Some(seconds) = warmup_seconds() else { return };
+        if DONE.load(Ordering::Relaxed) {
+            return;
+        }
+        if BEGAN.get_or_init(std::time::Instant::now).elapsed() < Duration::from_secs(seconds) {
+            return;
+        }
+        DONE.store(true, Ordering::Relaxed);
+        let mark = std::path::PathBuf::from(get("VICTORY_WARMUP_MARK"));
+        if !mark.as_os_str().is_empty() {
+            if let Some(dir) = mark.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(&mark, "this victory.exe was warmed up (its first start, then a restart)\r\n");
+        }
+        tracing::info!(seconds, mark = %mark.display(), "first start of this victory.exe: warmed up; the game starts again");
+        self.restart(false);
+    }
+
     /// Removes the settings file: the launcher's own settings at the next start.
     fn reset(&mut self) {
         if let Some(path) = std::env::var_os("VICTORY_MENU_FILE") {
@@ -491,6 +559,7 @@ impl Menu {
 
     /// A frame was presented: the keys pressed since the last one.
     pub(super) fn frame(&mut self) {
+        self.warmup();
         let pressed = std::mem::take(&mut *keys().lock().unwrap_or_else(|e| e.into_inner()));
         if pressed.is_empty() {
             return;
@@ -643,10 +712,12 @@ mod tests {
                 let n = lines.len();
                 assert!(lines[n - 2].starts_with("* = CHANGED") || lines[n - 2] == note, "{}", lines[n - 2]);
                 assert_eq!(lines[n - 1], REPO);
-                // What a preload costs is said while it is picked, and only then.
+                // What a preload costs, and what MFG Unlocker is, is said while it is picked, and only then.
                 let about = &lines[n - 5..n - 2];
                 if at == ITEMS.len() + PRELOAD {
                     assert_eq!(about, ABOUT_PRELOAD);
+                } else if at < ITEMS.len() && ITEMS[at].var == MFG {
+                    assert_eq!(about, ABOUT_MFG);
                 } else {
                     assert!(about.iter().all(String::is_empty), "{about:?}");
                 }
@@ -654,6 +725,8 @@ mod tests {
         }
         assert_eq!(ACTIONS[PRELOAD], "PRELOAD SHADERS (RESTARTS THE GAME)");
         assert!(CONFIRM_PRELOAD.len() <= COLUMNS as usize);
+        assert!(ABOUT_MFG.iter().all(|l| l.len() <= COLUMNS as usize));
+        assert_eq!(ITEMS.iter().filter(|i| i.var == MFG).count(), 1);
     }
 
     #[test]

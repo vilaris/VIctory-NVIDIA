@@ -127,6 +127,10 @@ mod texback;
 
 #[cfg(windows)]
 pub use host::on_failure;
+/// Reserves the address space for memory shaders read by address; call it
+/// first thing, before the process's other allocations can fill [4 GiB, 2^37).
+#[cfg(windows)]
+pub use upload::reserve_space as reserve_upload_space;
 
 /// The texture book: the title's DirectStorage requests followed as they
 /// finish, and what they fill made ready for the card (`texture::ledger`).
