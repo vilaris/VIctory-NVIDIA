@@ -775,7 +775,7 @@ mod library;
 #[cfg(windows)]
 mod make;
 #[cfg(windows)]
-mod samplers;
+pub(crate) mod samplers;
 
 /// Makes the static sampler states of earlier runs on the host device, in
 /// their order, before anything else makes one (`samplers::replay`): called

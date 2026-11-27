@@ -145,6 +145,22 @@ pub(crate) enum Use {
     Unplaced,
 }
 
+/// The sampler file is located beside the pipeline library, so this hint is
+/// retained for callers that also configure the shader cache.
+pub(crate) fn use_folder(_dir: PathBuf) {}
+
+/// Fingerprint component for sampler ordering. The library's own folder is
+/// authoritative for replay; include its bytes when available.
+pub(crate) fn order() -> Vec<u8> {
+    super::library::folder()
+        .and_then(|dir| std::fs::read(dir.join(FILE)).ok())
+        .unwrap_or_default()
+}
+
+/// Shader-cache notification; admission records states when the pipeline is
+/// built, where the host sampler descriptions are available.
+pub(crate) fn know(_samplers: &[victory_shader::emit::StaticSampler]) {}
+
 struct Table {
     /// Places of the states made first ([`replay`]).
     placed: HashMap<State, u32>,

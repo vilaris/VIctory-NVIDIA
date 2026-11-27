@@ -16,6 +16,7 @@
 //! `present` (swap chain).
 
 #[cfg(windows)]
+mod ahead;
 mod ambient;
 pub mod bench;
 mod bench_gpu;

@@ -238,6 +238,8 @@ pub(crate) struct Shader {
     pub wave_size: Option<u32>,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
+    /// Of those, the program's own (the first ones; ours follow).
+    pub title_lds_dwords: u32,
     lds: Option<V>,
     main: V,
     pub entry: usize,
@@ -291,6 +293,7 @@ impl Shader {
             threads: None,
             wave_size: None,
             lds_dwords: 0,
+            title_lds_dwords: 0,
             lds: None,
             main,
             entry,
