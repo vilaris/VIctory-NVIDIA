@@ -128,6 +128,7 @@ impl Made {
 pub(crate) struct HostHeap {
     pub(crate) buffer_sweep: Mutex<crate::draw::BufferSweep>,
     pub(crate) buffer_frame: std::sync::atomic::AtomicU64,
+    pub(crate) x9_buffer_frame: std::sync::atomic::AtomicU64,
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
@@ -2064,6 +2065,7 @@ impl HostHeap {
         let h = HostHeap {
             buffer_sweep: Mutex::default(),
             buffer_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
+            x9_buffer_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
             heap,
             cpu,
             step,
@@ -3388,6 +3390,11 @@ impl HostHeap {
     /// last call.
     pub(crate) fn buffer_changes(&self) -> Vec<u32> {
         self.changed.take()
+    }
+
+    pub(crate) fn x9_buffers_due(&self, frame: u64) -> bool {
+        self.x9_buffer_frame.load(Ordering::Relaxed) != frame
+            || self.changed.0.iter().any(|bits| bits.load(Ordering::Acquire) != 0)
     }
 
     /// Records what title slot `index` now holds for shaders that pick

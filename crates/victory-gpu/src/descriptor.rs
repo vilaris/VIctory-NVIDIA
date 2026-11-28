@@ -148,6 +148,15 @@ pub(crate) fn heap<'a>(this: This) -> &'a Heap {
 }
 
 impl Heap {
+    /// A deferred bindless sweep can outlive the title's heap reference.
+    #[cfg(windows)]
+    pub(crate) fn retain_x9(&self) -> RetainedHeap {
+        self.indexed.store(true, std::sync::atomic::Ordering::Release);
+        let this = std::ptr::from_ref(self).cast::<Object>();
+        object::add_ref(this);
+        RetainedHeap(this as usize)
+    }
+
     /// The queue's round happens after recording. The record-time heap
     /// sweeps need to discover copied descriptors before taking their
     /// buffer set or texture queue, even if no earlier list was submitted.
@@ -279,6 +288,31 @@ impl Heap {
         let at = handle.checked_sub(self.start)?;
         let index = at / step;
         (index < u64::from(self.desc.count)).then_some(index as u32)
+    }
+}
+
+#[cfg(windows)]
+pub(crate) struct RetainedHeap(usize);
+
+#[cfg(windows)]
+impl RetainedHeap {
+    pub(crate) fn get(&self) -> &Heap {
+        // SAFETY: the retained title reference keeps the heap alive until
+        // this value is dropped.
+        unsafe { &*(self.0 as *const Heap) }
+    }
+
+    pub(crate) fn range(&self) -> (usize, usize) {
+        let heap = self.get();
+        let bytes = usize::try_from(heap.desc.count).unwrap_or(0) * increment(heap.desc.kind).unwrap_or(0) as usize;
+        (heap.start as usize, (heap.start as usize).saturating_add(bytes))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for RetainedHeap {
+    fn drop(&mut self) {
+        release(self.0 as This);
     }
 }
 

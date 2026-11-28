@@ -3094,6 +3094,9 @@ struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
     x9_plan: Option<std::sync::Arc<OnceLock<x9_plan::Plan>>>,
+    x9_heap_sweeps: Vec<(usize, crate::descriptor::RetainedHeap)>,
+    x9_heaps_resolved: bool,
+    x9_heap_inserted: Vec<(usize, usize)>,
     uploads: Vec<ID3D12Resource>,
     /// Standalone upload footprints kept through this list's fence (movie planes).
     plane_uploads: Vec<(Chunk, u64)>,
@@ -3175,6 +3178,9 @@ impl Deferred {
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
         self.copies.clear();
         self.x9_plan = None;
+        self.x9_heap_sweeps.clear();
+        self.x9_heaps_resolved = false;
+        self.x9_heap_inserted.clear();
         self.uploads.clear();
         self.prelude_uploads.clear();
         self.upload_bytes = 0;
@@ -6561,6 +6567,37 @@ impl Host {
         self.execute_parts(lists, order, &[]);
     }
 
+    fn prepare_x9_heap_sweeps(&self, runs: &[&HostList], submitted: &mut u64) {
+        let _time = crate::rf_x9::timer(crate::rf_x9::Work::HeapDiscovery);
+        let ranges: Vec<_> = runs.iter().flat_map(|list| {
+            let deferred = list.deferred();
+            if deferred.x9_heaps_resolved {
+                Vec::new()
+            } else {
+                deferred.x9_heap_sweeps.iter().map(|(_, heap)| heap.range()).collect()
+            }
+        }).collect();
+        {
+            let overlaps = |line: &Line| ranges.iter().any(|&(lo, hi)| touches(&line.written, lo, hi));
+            let must_land = overlaps(&line());
+            if must_land {
+                if relay_exact() {
+                    relay_wait(WHY_READ, |line| !overlaps(line));
+                } else {
+                    self.settle(submitted, WHY_READ);
+                }
+            }
+        }
+        // Resolve the raw records after the title's waits and after any
+        // landing that supplies them. Each resolved read is fed back into
+        // the ordinary flight, watch and card-steps planning at its index.
+        drop(crate::descriptor::begin_sync_heaps());
+        let frame = crate::frame::current();
+        for list in runs {
+            list.resolve_x9_heap_sweeps(frame);
+        }
+    }
+
     /// [`Host::execute_late`] of parts of submissions in one: another begins
     /// at each place of `order` in `parts` ([`joins`]).
     pub(crate) fn execute_parts(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>, parts: &[usize]) {
@@ -6571,6 +6608,13 @@ impl Host {
         late_threads();
         if let Some(cut) = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
+            if crate::rf_x9::enabled() && runs.len() > 1 && card_steps::stage() != 0
+                && runs.iter().any(|list| list.x9_heap_sweep_pending())
+                && runs.iter().any(|list| list.deferred().copies.iter().any(|step| matches!(step, Step::Placed(_))))
+            {
+                let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+                self.prepare_x9_heap_sweeps(&runs, &mut submitted);
+            }
             card_steps::cut_for(&runs)
         } {
             match split(lists, order, cut) {
@@ -6922,6 +6966,14 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut stage = crate::timeline::span("submit: the submission lock");
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let x9 = crate::rf_x9::enabled();
+        let x9_heaps_prepared = x9 && runs.iter().any(|list| list.x9_heap_sweep_pending());
+        if x9_heaps_prepared {
+            if !late {
+                self.settle(&mut submitted, WHY_SYNC);
+            }
+            self.prepare_x9_heap_sweeps(runs, &mut submitted);
+        }
         // Upscalings these lists recorded, in submission order: the next
         // present tags the latest (frame generation).
         for run in runs {
@@ -6939,11 +6991,10 @@ impl Host {
         // The round of the heaps' records asked for when the title submitted
         // these lists, if that is known (`crate::heap_marks`, 0: not).
         let heaps_mark = if late { crate::heap_marks::needed() } else { 0 };
-        let x9 = crate::rf_x9::enabled();
         let needs_heaps = (late || x9) && runs.iter().any(|l| l.heap_picked());
         // Else with [`heap_sync_first`]: the heaps' records begun now, beside
         // the planning of steps done on the card and the look at flights.
-        let first_heaps = (late && needs_heaps && heaps_mark == 0
+        let first_heaps = (late && needs_heaps && !x9_heaps_prepared && heaps_mark == 0
             && (heap_sync_first() || (x9 && crate::descriptor::sync_aside())))
             .then(crate::descriptor::begin_sync_heaps);
         let ahead = Split::begin();
@@ -6980,7 +7031,7 @@ impl Host {
         // as the round began here saw them; the first is not waited for.)
         // With a mark (`crate::heap_marks`): that round, unless the
         // submission waited for flights, whose landings came after it.
-        let mut heaps_synced = if !needs_heaps {
+        let mut heaps_synced = if !needs_heaps || x9_heaps_prepared && !waited_for_flights {
             None
         } else {
             Some(match first_heaps {
@@ -7413,6 +7464,9 @@ impl Host {
             read_backs(list);
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
+            }
+            if x9 {
+                list.clear_x9_heap_sweeps();
             }
         }
         self.log_messages();
@@ -8687,6 +8741,66 @@ impl HostList {
     /// its immutable steps before the queue's earlier submission is ready.
     pub(crate) fn plan_x9_capture(&self) {
         self.deferred.plan();
+    }
+
+    pub(crate) fn defer_x9_heap_buffers(&self, heap: &crate::descriptor::Heap) -> bool {
+        if !crate::rf_x9::enabled() {
+            return false;
+        }
+        let mut deferred = self.deferred();
+        let at = deferred.copies.len();
+        deferred.x9_heap_sweeps.push((at, heap.retain_x9()));
+        true
+    }
+
+    fn x9_heap_sweep_pending(&self) -> bool {
+        let deferred = self.deferred();
+        !deferred.x9_heaps_resolved && !deferred.x9_heap_sweeps.is_empty()
+    }
+
+    fn resolve_x9_heap_sweeps(&self, frame: u64) {
+        let mut deferred = self.deferred();
+        if deferred.x9_heaps_resolved || deferred.x9_heap_sweeps.is_empty() {
+            return;
+        }
+        deferred.x9_heaps_resolved = true;
+        let sweeps = std::mem::take(&mut deferred.x9_heap_sweeps);
+        drop(deferred);
+
+        let mut refreshes = Vec::new();
+        for (index, heap) in &sweeps {
+            let heap = heap.get();
+            if let Some(host) = heap.host() && host.x9_buffers_due(frame) {
+                let found = crate::draw::heap_buffer_pass(heap, host, frame);
+                host.x9_buffer_frame.store(frame, Ordering::Relaxed);
+                refreshes.push((*index, found));
+            }
+        }
+
+        let mut deferred = self.deferred();
+        deferred.x9_heap_sweeps = sweeps;
+        if !refreshes.is_empty() {
+            // The preplanner's indices describe the unexpanded recording.
+            deferred.x9_plan = None;
+        }
+        for (index, found) in refreshes.into_iter().rev() {
+            let before = deferred.copies.len();
+            deferred.copies.splice(index..index, found.into_iter().filter_map(|(shadow, from, to)| {
+                (!shadow.in_place()).then_some(Step::Refresh(shadow, from as usize, (to - from) as usize))
+            }));
+            let inserted = deferred.copies.len() - before;
+            deferred.x9_heap_inserted.push((index, inserted));
+        }
+    }
+
+    /// Synchronous lists can be submitted again. Once their fence and
+    /// landings complete, restore the recording for the next submission.
+    fn clear_x9_heap_sweeps(&self) {
+        let mut deferred = self.deferred();
+        while let Some((index, count)) = deferred.x9_heap_inserted.pop() {
+            deferred.copies.drain(index..index + count);
+        }
+        deferred.x9_heaps_resolved = false;
     }
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.

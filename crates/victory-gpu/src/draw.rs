@@ -1199,7 +1199,7 @@ const OTHERS: usize = 1;
 /// The pass over the buffer views of `heap` that shaders pick by index
 /// ([`State::heap_buffers`]): their host slots are made, and the host copies
 /// they show are to be refreshed.
-fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::HostHeap, frame: u64) -> Vec<crate::host::aside::Refresh> {
+pub(crate) fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::HostHeap, frame: u64) -> Vec<crate::host::aside::Refresh> { // rf-x9
     let started = std::time::Instant::now();
     // Per host heap: the host copy and range each slot's buffer view
     // reads, kept from pass to pass. Only the slots written since the
@@ -2534,13 +2534,18 @@ impl State {
         // shortcut: what the title writes into such buffers between lists
         // of one frame is seen a frame late.
         let frame = crate::frame::current();
-        heap.sync_before_heap_pass(frame, crate::descriptor::HeapPass::Buffers);
+        let submit_sweep = list.defer_x9_heap_buffers(heap); // rf-x9
+        if !submit_sweep {
+            heap.sync_before_heap_pass(frame, crate::descriptor::HeapPass::Buffers);
+        }
         if host.buffer_frame.swap(frame, Ordering::Relaxed) == frame {
             return Some(gpu);
         }
         let started = std::time::Instant::now();
         let mut stage = crate::timeline::span("the heap pass: begun, or done here");
-        if crate::host::aside::on() {
+        if submit_sweep { // rf-x9
+            heap.sync_before_heap_pass(frame, crate::descriptor::HeapPass::EarlyTextures);
+        } else if crate::host::aside::on() {
             let at = std::ptr::from_ref(heap) as usize;
             list.refreshes_coming(move || {
                 crate::descriptor::with_heap(at, |heap| {
