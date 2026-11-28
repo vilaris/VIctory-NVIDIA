@@ -219,11 +219,58 @@ pub(super) struct Memory {
     buffer: ID3D12Resource,
     data: usize,
     size: u64,
+    offset: u64,
+    ring: Option<UploadLease>,
     vram: Option<VramBuffer>,
 }
 
-// SAFETY: a D3D12 object (free-threaded) and its mapping, with one owner.
+// SAFETY: a D3D12 object (free-threaded) and exclusive access to this slice.
 unsafe impl Send for Memory {}
+
+struct RingMemory {
+    buffer: ID3D12Resource,
+    data: usize,
+    slots: Mutex<crate::rf_x9::UploadRing>,
+}
+
+struct UploadLease {
+    slots: &'static Mutex<crate::rf_x9::UploadRing>,
+    token: u64,
+}
+
+impl Drop for UploadLease {
+    fn drop(&mut self) {
+        self.slots.lock().unwrap_or_else(|e| e.into_inner()).release(self.token);
+    }
+}
+
+const RING_BYTES: u64 = 32 << 20;
+
+fn ring_memory(host: &Host, size: u64) -> Option<Memory> {
+    static RING: OnceLock<Option<RingMemory>> = OnceLock::new();
+    if size > RING_BYTES {
+        return None;
+    }
+    let ring = RING.get_or_init(|| {
+        let (buffer, data) = host.upload_buffer(RING_BYTES)?;
+        name(&buffer, || "X9 submission upload ring".into());
+        Some(RingMemory {
+            buffer,
+            data: data as usize,
+            slots: Mutex::new(crate::rf_x9::UploadRing::new(RING_BYTES)),
+        })
+    }).as_ref()?;
+    let (offset, token) = ring.slots.lock().unwrap_or_else(|e| e.into_inner()).reserve(size)?;
+    crate::rf_x9::traffic(crate::rf_x9::Traffic::UploadRing, || size);
+    Some(Memory {
+        buffer: ring.buffer.clone(),
+        data: ring.data + offset as usize,
+        size,
+        offset,
+        ring: Some(UploadLease { slots: &ring.slots, token }),
+        vram: None,
+    })
+}
 
 /// What submissions that have run gave back.
 static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
@@ -250,6 +297,9 @@ fn on_card() -> bool {
 }
 
 fn memory(host: &Host, size: u64) -> Option<Memory> {
+    if crate::rf_x9::enabled() && !on_card() && let Some(memory) = ring_memory(host, size) {
+        return Some(memory);
+    }
     {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         let fit = spare.iter().enumerate().filter(|(_, m)| m.size >= size).min_by_key(|(_, m)| m.size).map(|(i, _)| i);
@@ -270,6 +320,8 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
         buffer,
         data: data as usize,
         size,
+        offset: 0,
+        ring: None,
         vram: None,
     })
 }
@@ -297,6 +349,9 @@ pub(super) fn give_back(mut memory: Memory) {
         while spare_vram.iter().map(|v| v.size).sum::<u64>() > KEPT_VRAM {
             spare_vram.remove(0);
         }
+    }
+    if memory.ring.is_some() {
+        return;
     }
     let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
     spare.push(memory);
@@ -634,7 +689,7 @@ impl Own {
         {
             recorded += 1;
             // SAFETY: the caller's; live buffers, range inside both.
-            unsafe { list.CopyBufferRegion(&vram.buffer, 0, &self.memory.buffer, 0, self.vram_bytes) };
+            unsafe { list.CopyBufferRegion(&vram.buffer, 0, &self.memory.buffer, self.memory.offset, self.vram_bytes) };
             first.push(transition(&vram.buffer, dest, read));
             last.push(transition(&vram.buffer, read, common));
         }
@@ -644,7 +699,7 @@ impl Own {
             for (a, from, n) in joined_runs(&copy.runs) {
                 recorded += 1;
                 // SAFETY: the caller's; live buffers, ranges inside them.
-                unsafe { list.CopyBufferRegion(&shadow.buffer, a as u64, &self.memory.buffer, from, n as u64) };
+                unsafe { list.CopyBufferRegion(&shadow.buffer, a as u64, &self.memory.buffer, self.memory.offset + from, n as u64) };
             }
             let mut state = (looked(shadow) || !copy.runs.is_empty()).then_some(dest);
             let uav_writes = copy.tiles.1 > 0 || copy.pairs.1 > 0;
@@ -672,7 +727,7 @@ impl Own {
                 .memory
                 .vram
                 .as_ref()
-                .map_or_else(|| self.memory.buffer.GetGPUVirtualAddress(), |v| v.buffer.GetGPUVirtualAddress());
+                .map_or_else(|| self.memory.buffer.GetGPUVirtualAddress() + self.memory.offset, |v| v.buffer.GetGPUVirtualAddress());
             if let Some(bulk) = bulk_pass(host)
                 && self.copies.iter().any(|c| c.tiles.1 > 0)
             {

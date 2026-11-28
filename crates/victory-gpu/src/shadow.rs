@@ -5477,6 +5477,16 @@ impl Shadow {
             return self.copy(from, to);
         };
         let whole = !known && !card.has_before.load(Ordering::Acquire);
+        if whole && crate::rf_x9::enabled() && !crate::host::upcheck::on() {
+            // The legacy compare bypass already marks every byte dirty in
+            // this case. Fill the mapped CPU side directly, preserving both
+            // the shadow stamps and the ordinary dirty-send bookkeeping.
+            let bytes = self.copy(from, to);
+            SEND[0].fetch_add(bytes as u64, Ordering::Relaxed);
+            SEND[2].fetch_add(bytes as u64, Ordering::Relaxed);
+            SEND[3].fetch_add((to.div_ceil(PAGE) - from / PAGE) as u64, Ordering::Relaxed);
+            return bytes;
+        }
         let start = self.start as usize;
         // Title memory is read through the kernel in chunks of up to this
         // many pages, not a call a page: the call's own cost was paid some

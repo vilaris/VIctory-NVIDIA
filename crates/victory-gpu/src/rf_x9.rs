@@ -114,6 +114,58 @@ pub(crate) fn upload_jobs(
     (copies, starts)
 }
 
+/// Tracks the live slices of one persistently mapped upload buffer. A
+/// reservation never crosses the physical end. Out-of-order retirement
+/// cannot release an older live slice or the padding before it.
+#[cfg(any(windows, test))]
+pub(crate) struct UploadRing {
+    capacity: u64,
+    head: u64,
+    tail: u64,
+    pending: std::collections::VecDeque<(u64, bool)>,
+}
+
+#[cfg(any(windows, test))]
+impl UploadRing {
+    const ALIGN: u64 = 256;
+
+    pub(crate) fn new(capacity: u64) -> Self {
+        assert!(capacity != 0 && capacity.is_multiple_of(Self::ALIGN));
+        Self { capacity, head: 0, tail: 0, pending: Default::default() }
+    }
+
+    /// Returns the buffer offset and the retirement token.
+    pub(crate) fn reserve(&mut self, bytes: u64) -> Option<(u64, u64)> {
+        if bytes == 0 || bytes > self.capacity {
+            return None;
+        }
+        let bytes = bytes.next_multiple_of(Self::ALIGN);
+        let offset = self.tail % self.capacity;
+        let padding = if bytes > self.capacity - offset { self.capacity - offset } else { 0 };
+        let start = self.tail.checked_add(padding)?;
+        let end = start.checked_add(bytes)?;
+        if end - self.head > self.capacity {
+            return None;
+        }
+        self.tail = end;
+        self.pending.push_back((end, false));
+        Some((start % self.capacity, end))
+    }
+
+    pub(crate) fn release(&mut self, token: u64) {
+        let retired = self.pending.iter_mut().find(|(end, _)| *end == token).expect("live upload lease");
+        retired.1 = true;
+        while let Some(&(end, true)) = self.pending.front() {
+            self.pending.pop_front();
+            self.head = end;
+        }
+        if self.pending.is_empty() {
+            self.head = 0;
+            self.tail = 0;
+        }
+    }
+}
+
 #[cfg(windows)]
 mod telemetry {
     use super::{Ordering, stats};
@@ -141,11 +193,12 @@ mod telemetry {
         GuardRefresh,
         UntrackedRefresh,
         TextureRead,
+        UploadRing,
     }
 
     static WORK: [[AtomicU64; 2]; 7] =
         [const { [const { AtomicU64::new(0) }; 2] }; 7];
-    static TRAFFIC: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    static TRAFFIC: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
     static BITMAP: AtomicU64 = AtomicU64::new(0);
     static GAPS: AtomicU64 = AtomicU64::new(0);
     static WATCH_CHANGED: AtomicU64 = AtomicU64::new(0);
@@ -202,11 +255,11 @@ mod telemetry {
         let per_frame = |counter: &AtomicU64| counter.swap(0, Ordering::Relaxed) as f64 / frames;
         let [refresh, descriptor, capture, fault, record_heap_wait, pack, texture] =
             WORK.each_ref().map(|row| [per_frame(&row[0]), per_frame(&row[1]) / 1e6]);
-        let [ring, upload, readback, descriptors, kernel, guard, untracked, texture_read] =
+        let [scratch, upload, readback, descriptors, kernel, guard, untracked, texture_read, ring] =
             TRAFFIC.each_ref().map(|value| per_frame(value) / (1 << 20) as f64);
         let ms = split.map(|ns| ns as f64 / 1e6 / frames);
         tracing::info!(
-            "rf-x9: enabled={} frames={frames:.0} submit-ms[lock={:.3} plan={:.3} watch={:.3} flights={:.3} steps={:.3} refresh={:.3} snapshots={:.3} card={:.3} heaps={:.3} send={:.3}] jobs[count/ms per frame refresh={:.1}/{:.3} descriptor={:.1}/{:.3} capture={:.1}/{:.3} record-heap-wait={:.1}/{:.3}] faults[count/ms per frame={:.1}/{:.3} bitmap={:.1}] MiB/frame[upload-scratch={ring:.2} card-up={upload:.2} gpu-down={readback:.2} descriptors-read={descriptors:.2} kernel-refresh={kernel:.2} guard-refresh={guard:.2} untracked-refresh={untracked:.2} gaps-excluded={:.2}] transitions/frame[watch={:.1} parked-eager={:.1}]",
+            "rf-x9: enabled={} frames={frames:.0} submit-ms[lock={:.3} plan={:.3} watch={:.3} flights={:.3} steps={:.3} refresh={:.3} snapshots={:.3} card={:.3} heaps={:.3} send={:.3}] jobs[count/ms per frame refresh={:.1}/{:.3} descriptor={:.1}/{:.3} capture={:.1}/{:.3} record-heap-wait={:.1}/{:.3}] faults[count/ms per frame={:.1}/{:.3} bitmap={:.1}] MiB/frame[upload-scratch={scratch:.2} card-up={upload:.2} gpu-down={readback:.2} descriptors-read={descriptors:.2} kernel-refresh={kernel:.2} guard-refresh={guard:.2} untracked-refresh={untracked:.2} gaps-excluded={:.2}] transitions/frame[watch={:.1} parked-eager={:.1}]",
             super::enabled(), ms[11], ms[12] + ms[14], ms[0], ms[1] + ms[13], ms[2],
             ms[6], ms[3], ms[4], ms[15], ms[5], refresh[0], refresh[1], descriptor[0],
             descriptor[1], capture[0], capture[1], record_heap_wait[0], record_heap_wait[1],
@@ -215,7 +268,7 @@ mod telemetry {
             per_frame(&WATCH_CHANGED), per_frame(&CPU_READ),
         );
         tracing::info!(
-            "rf-x9: jobs[count/ms per frame upload-pack={:.1}/{:.3} texture={:.1}/{:.3}] MiB/frame[texture-read={texture_read:.2}]",
+            "rf-x9: jobs[count/ms per frame upload-pack={:.1}/{:.3} texture={:.1}/{:.3}] MiB/frame[texture-read={texture_read:.2} upload-ring={ring:.2}]",
             pack[0], pack[1], texture[0], texture[1],
         );
     }
@@ -322,6 +375,22 @@ mod tests {
         assert_eq!(moves, [(200, 16, 8), (208, 24, 4), (400, 64, 3), (500, 80, 1), (501, 81, 1)]);
         assert_eq!(starts, [0, 1, 4, 5]);
         assert_eq!(upload_jobs(&[(1, 2, 0)], 8), (Vec::new(), vec![0]));
+    }
+
+    #[test]
+    fn upload_ring_wraps_after_older_slices_retire() {
+        let mut ring = UploadRing::new(1024);
+        let (a, first) = ring.reserve(500).unwrap();
+        let (b, second) = ring.reserve(250).unwrap();
+        assert_eq!((a, b), (0, 512));
+        assert!(ring.reserve(500).is_none());
+        ring.release(first);
+        let (c, third) = ring.reserve(500).unwrap();
+        assert_eq!(c, 0);
+        ring.release(third);
+        assert!(ring.reserve(1).is_none());
+        ring.release(second);
+        assert_eq!(ring.reserve(1024).map(|r| r.0), Some(0));
     }
 
     #[test]
