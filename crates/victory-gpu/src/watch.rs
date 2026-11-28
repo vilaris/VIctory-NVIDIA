@@ -1132,6 +1132,21 @@ pub(crate) fn part_write(page: usize) -> Option<[u64; PARTS]> {
 }
 
 impl Tracked {
+    // rf-x4
+    /// Independent cursor for the reference scan. Both cursors query
+    /// the shared write journal, and neither changes the other's progress.
+    pub(crate) fn rf_x4_cursor(&self) -> Self {
+        Self { start: self.start, end: self.end, seen: Mutex::default() }
+    }
+
+    /// Read failures leave the complete page pending for a later rf-x4 round.
+    pub(crate) fn rf_x4_retry(&self, addresses: &[usize]) {
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        for &at in addresses {
+            seen.remove(&(at / PAGE));
+        }
+    }
+
     /// Takes changed pages of `[from, to)`, cut to the tracked range. A
     /// partial page stays changed so a later take can read its other bytes.
     pub(crate) fn take(&self, from: usize, to: usize) -> Vec<(usize, usize)> {

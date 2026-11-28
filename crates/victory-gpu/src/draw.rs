@@ -1979,6 +1979,16 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        if crate::descriptor::rf_x4::note_enabled() { // rf-x4
+            for stage in &p.stages {
+                let t = stage.translated();
+                let missing_table = t.host.user_data.iter().filter(|u| u.root == RootType::Table).any(|u| {
+                    let Some(&Root::Table(h)) = self.roots_ref(compute).get(usize::from(u.slot)) else { return true };
+                    !self.heap_of(h).is_some_and(|heap| heap.index(h).and_then(|slot| heap.handle(slot)) == Some(h))
+                });
+                crate::descriptor::rf_x4::note_shader(list, self.heaps, &stage.shader, t, missing_table);
+            }
+        }
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
         if crate::host::walls_trace() {
@@ -1993,6 +2003,7 @@ impl State {
             once!("a dispatch without a view heap that needs one gets the title's");
             list.note_heap_picked();
             self.heaps[0] = heap;
+            crate::descriptor::rf_x4::note_lent(list, self.heaps); // rf-x4
         }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them, with both a view heap and a sampler heap bound.

@@ -29,6 +29,12 @@
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
+/// Store the pick on the recorded list, which can outlive this thread and
+/// be submitted more than once. The host ORs this bit across submitted lists.
+pub(crate) fn note_pick(list: &crate::host::HostList) {
+    list.note_heap_picked();
+}
+
 /// Whether the switch is on.
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
