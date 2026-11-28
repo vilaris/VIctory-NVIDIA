@@ -530,19 +530,6 @@ fn take_with(
         }
     }
 
-    for (start, end, off) in tile_slices {
-        let slice = &all_tiles[start..end];
-        // SAFETY: `memory.data` has at least `total_upload` bytes and `off`
-        // reserves `slice.len() * TILE_STRIDE` disjoint bytes inside `[0..vram_at)`.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                slice.as_ptr().cast::<u8>(),
-                (memory.data + off as usize) as *mut u8,
-                std::mem::size_of_val(slice),
-            );
-        }
-    }
-
     let fallback_runs: usize = copies.iter().map(|c| c.runs.len()).sum();
     let mut moves: Vec<(usize, usize, usize)> = Vec::with_capacity(bulk_moves.len() + fallback_runs);
     moves.extend(
@@ -574,14 +561,36 @@ fn take_with(
             }
         }
     };
-    crate::land::each_under(pending_work.len(), &one);
-
     STATS[0].fetch_add(moves.iter().map(|m| m.2 as u64).sum(), Ordering::Relaxed);
     STATS[1].fetch_add(moves.len() as u64, Ordering::Relaxed);
     STATS[2].fetch_add(total_words, Ordering::Relaxed);
     STATS[4].fetch_add(copies.iter().flat_map(|copy| &copy.runs).map(|run| run.2 as u64).sum(), Ordering::Relaxed);
     STATS[5].fetch_add(vram_bytes, Ordering::Relaxed);
-    crate::shadow::copy_all(moves);
+    let tile_moves = tile_slices.into_iter().map(|(start, end, off)| {
+        let slice = &all_tiles[start..end];
+        (slice.as_ptr() as usize, memory.data + off as usize, std::mem::size_of_val(slice))
+    });
+    if crate::rf_x9::enabled() {
+        moves.extend(tile_moves);
+        // The plan has already assigned disjoint destinations to payload,
+        // tile tables and pairs. Run all three in one wave while the source
+        // shadows and this submission's upload allocation are still held.
+        let (moves, starts) = crate::rf_x9::upload_jobs(&moves, 256 << 10);
+        let pairs = pending_work.len();
+        crate::land::each_under(pairs + starts.len() - 1, &|i| {
+            let _job = crate::rf_x9::timer(crate::rf_x9::Work::UploadPack);
+            if i < pairs {
+                one(i);
+            } else {
+                let job = i - pairs;
+                copy_upload(&moves[starts[job]..starts[job + 1]]);
+            }
+        });
+    } else {
+        tile_moves.for_each(|m| copy_upload(std::slice::from_ref(&m)));
+        crate::land::each_under(pending_work.len(), &one);
+        crate::shadow::copy_all(moves);
+    }
     STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
 
     Some(Own {
@@ -589,6 +598,14 @@ fn take_with(
         copies,
         vram_bytes,
     })
+}
+
+fn copy_upload(moves: &[(usize, usize, usize)]) {
+    for &(src, dst, bytes) in moves {
+        // SAFETY: these moves are made by `take_with` from live sources to
+        // disjoint slices of its private upload mapping, then joined there.
+        unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, bytes) };
+    }
 }
 
 impl Own {

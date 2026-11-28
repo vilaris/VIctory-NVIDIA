@@ -83,6 +83,37 @@ impl Ranges {
     }
 }
 
+/// Split upload copies into disjoint jobs with a bounded byte count. The
+/// offsets already belong to the submission, including any alignment gaps.
+#[cfg(any(windows, test))]
+pub(crate) fn upload_jobs(
+    moves: &[(usize, usize, usize)],
+    limit: usize,
+) -> (Vec<(usize, usize, usize)>, Vec<usize>) {
+    assert!(limit > 0);
+    let mut copies = Vec::with_capacity(moves.len());
+    let mut starts = vec![0];
+    let mut used = 0;
+    for &(mut source, mut target, mut bytes) in moves {
+        while bytes != 0 {
+            let take = bytes.min(limit - used);
+            copies.push((source, target, take));
+            source += take;
+            target += take;
+            bytes -= take;
+            used += take;
+            if used == limit {
+                starts.push(copies.len());
+                used = 0;
+            }
+        }
+    }
+    if used != 0 {
+        starts.push(copies.len());
+    }
+    (copies, starts)
+}
+
 #[cfg(windows)]
 mod telemetry {
     use super::{Ordering, stats};
@@ -96,6 +127,8 @@ mod telemetry {
         Capture,
         Fault,
         RecordHeapWait,
+        UploadPack,
+        Texture,
     }
 
     #[derive(Clone, Copy)]
@@ -107,11 +140,12 @@ mod telemetry {
         KernelRefresh,
         GuardRefresh,
         UntrackedRefresh,
+        TextureRead,
     }
 
-    static WORK: [[AtomicU64; 2]; 5] =
-        [const { [const { AtomicU64::new(0) }; 2] }; 5];
-    static TRAFFIC: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+    static WORK: [[AtomicU64; 2]; 7] =
+        [const { [const { AtomicU64::new(0) }; 2] }; 7];
+    static TRAFFIC: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
     static BITMAP: AtomicU64 = AtomicU64::new(0);
     static GAPS: AtomicU64 = AtomicU64::new(0);
     static WATCH_CHANGED: AtomicU64 = AtomicU64::new(0);
@@ -166,9 +200,9 @@ mod telemetry {
             return;
         }
         let per_frame = |counter: &AtomicU64| counter.swap(0, Ordering::Relaxed) as f64 / frames;
-        let [refresh, descriptor, capture, fault, record_heap_wait] =
+        let [refresh, descriptor, capture, fault, record_heap_wait, pack, texture] =
             WORK.each_ref().map(|row| [per_frame(&row[0]), per_frame(&row[1]) / 1e6]);
-        let [ring, upload, readback, descriptors, kernel, guard, untracked] =
+        let [ring, upload, readback, descriptors, kernel, guard, untracked, texture_read] =
             TRAFFIC.each_ref().map(|value| per_frame(value) / (1 << 20) as f64);
         let ms = split.map(|ns| ns as f64 / 1e6 / frames);
         tracing::info!(
@@ -179,6 +213,10 @@ mod telemetry {
             fault[0], fault[1], per_frame(&BITMAP),
             per_frame(&GAPS) / (1 << 20) as f64,
             per_frame(&WATCH_CHANGED), per_frame(&CPU_READ),
+        );
+        tracing::info!(
+            "rf-x9: jobs[count/ms per frame upload-pack={:.1}/{:.3} texture={:.1}/{:.3}] MiB/frame[texture-read={texture_read:.2}]",
+            pack[0], pack[1], texture[0], texture[1],
         );
     }
 }
@@ -277,6 +315,14 @@ impl FaultBitmap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upload_jobs_split_large_runs_and_preserve_offsets_and_gaps() {
+        let (moves, starts) = upload_jobs(&[(100, 0, 0), (200, 16, 12), (400, 64, 3), (500, 80, 2)], 8);
+        assert_eq!(moves, [(200, 16, 8), (208, 24, 4), (400, 64, 3), (500, 80, 1), (501, 81, 1)]);
+        assert_eq!(starts, [0, 1, 4, 5]);
+        assert_eq!(upload_jobs(&[(1, 2, 0)], 8), (Vec::new(), vec![0]));
+    }
 
     #[test]
     fn bitmap_coalesces_and_drains_across_group_boundaries() {

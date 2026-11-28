@@ -7072,7 +7072,7 @@ impl Host {
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         let once = crate::watch::once();
-        let front = refresh_front();
+        let front = refresh_front() || (x9 && parts.len() <= 1 && ahead_of_writes());
         if once || front {
             batch.copy_spans(runs, front.then_some(parts.as_slice()));
         }
@@ -10097,6 +10097,11 @@ impl Batch {
         self.spans.clear();
         self.spans_at.clear();
         let textures = front.is_some() && wide_textures();
+        // An opaque CPU step or a title copy can supply later readers with
+        // new bytes. Keep those texture checks in the following wave.
+        // Buffer envelopes still cover all parts for the flight check.
+        let x9 = crate::rf_x9::enabled();
+        let mut before_title_write = true;
         let mut part = 0;
         let mut last = (0, 0);
         for (n, list) in runs.iter().enumerate() {
@@ -10110,17 +10115,24 @@ impl Batch {
                         self.front_spans.write(std::sync::Arc::as_ptr(shadow) as usize, part);
                         continue;
                     }
-                    Step::Texture(staging) if textures => {
+                    Step::Texture(staging) if textures && before_title_write => {
                         if self.texture_due(staging) {
                             self.due.push(staging.clone());
                         }
+                        continue;
+                    }
+                    Step::Copy(..) | Step::Placed(_) | Step::Run(_) if x9 => {
+                        before_title_write = false;
                         continue;
                     }
                     _ => continue,
                 };
                 let (from, to) = (*address, *address + *len);
                 let key = std::sync::Arc::as_ptr(shadow) as usize;
-                if front.is_some() {
+                // For joined parts preserve the legacy buffer schedule:
+                // a later part may need title bytes from before an earlier
+                // part declared the same copy writable by the GPU.
+                if front.is_some_and(|parts| before_title_write || parts.len() > 1) {
                     self.front_spans.refresh_range(key, from, to, part, self.narrow && shadow.x9_narrow_refresh());
                 }
                 let at = if last.0 == key && key != 0 {
@@ -10477,14 +10489,17 @@ impl Batch {
     }
 
     fn flush(&mut self) {
-        self.refresh_textures();
+        let mixed = crate::rf_x9::enabled() && wide_refresh() && !self.refreshes.is_empty() && !self.due.is_empty();
+        if !mixed {
+            self.refresh_textures();
+        }
         self.index.clear();
         if self.refreshes.is_empty() {
             return;
         }
         let (began, all) = (std::time::Instant::now(), self.refreshes.len());
         let _flush = crate::timeline::span("refreshes of copies");
-        self.flush_all();
+        self.flush_all(mixed);
         let ns = began.elapsed().as_nanos() as u64;
         SPLIT[6].fetch_add(ns, Ordering::Relaxed);
         crate::rf_x3::refresh_wall(crate::rf_x3::Check::FlushWall, ns); // rf-x3
@@ -10492,7 +10507,7 @@ impl Batch {
         FLUSHES[1].fetch_add(all as u64, Ordering::Relaxed);
     }
 
-    fn flush_all(&mut self) {
+    fn flush_all(&mut self, mixed: bool) {
         // Most of a flush's copies are as they were: they are told so here,
         // from what the submission's asking found, before anything is asked
         // and any thread woken. (Thousands of them, the heap's buffer views
@@ -10527,7 +10542,30 @@ impl Batch {
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
-        if wide_refresh() && self.refreshes.len() >= 4 {
+        if mixed {
+            let refreshes = std::mem::take(&mut self.refreshes);
+            let textures = std::mem::take(&mut self.due);
+            let texture_before = PREPARING[2].load(Ordering::Relaxed);
+            let copy_before = PREPARING[0].load(Ordering::Relaxed);
+            let started = std::time::Instant::now();
+            FLUSHES[3].fetch_add(refreshes.len() as u64, Ordering::Relaxed);
+            crate::shadow::wide_each(textures.len() + refreshes.len(), move |i| {
+                if let Some(staging) = textures.get(i) {
+                    staging.refresh();
+                } else {
+                    let (shadow, from, to) = &refreshes[i - textures.len()];
+                    let key = std::sync::Arc::as_ptr(shadow) as usize;
+                    Self::update_ranges(shadow, *from, *to, exact.get(&key));
+                }
+            });
+            // Both streams occupied one wall interval. Leave the summed
+            // job times to rf-x9 and bill this join once to preparing.
+            let textures = PREPARING[2].load(Ordering::Relaxed).saturating_sub(texture_before);
+            let copies = PREPARING[0].load(Ordering::Relaxed).saturating_sub(copy_before);
+            PREPARING[2].fetch_sub(textures, Ordering::Relaxed);
+            PREPARING[0].fetch_sub(copies, Ordering::Relaxed);
+            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        } else if wide_refresh() && self.refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
             // The time counted is the time it took, not the threads' sum.
