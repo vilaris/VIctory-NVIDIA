@@ -15,6 +15,14 @@ pub(crate) fn incremental_bindless() -> bool {
     *ON.get_or_init(|| enabled() && std::env::var_os("VICTORY_RF_X9_BINDLESS_INCREMENTAL").is_some_and(|v| v == "1"))
 }
 
+/// Moving the sweep to submission can require a descriptor readback from
+/// an earlier flight. Keep the recording route available independently of X9.
+#[cfg(windows)]
+pub(crate) fn bindless_at_submit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| incremental_bindless() && std::env::var_os("VICTORY_RF_X9_BINDLESS_SUBMIT").is_some_and(|v| v == "1"))
+}
+
 #[cfg(windows)]
 pub(crate) fn defer_descriptor_rearm() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -123,6 +131,35 @@ impl Ranges {
             visit(next, to);
         }
     }
+}
+
+/// The raw heap read ends at the last slot with a host counterpart.
+#[cfg(any(windows, test))]
+pub(crate) fn mirrored_heap_span(start: usize, title_count: u32, host_count: u32, stride: usize) -> (usize, usize) {
+    (start, start.saturating_add((title_count.min(host_count) as usize).saturating_mul(stride)))
+}
+
+#[cfg(test)]
+#[test]
+fn flight_checks_only_include_the_mirrored_part_of_each_heap() {
+    const HEAPS: usize = 3;
+    const SUBMISSIONS: usize = 32;
+    let mut before = 0;
+    let mut after = 0;
+    for i in 0..SUBMISSIONS {
+        for heap in 0..HEAPS {
+            let base = 0x0100_0000 * (heap + 1);
+            let (old, new) = (mirrored_heap_span(base, 1_000_000, 1_000_000, 32),
+                mirrored_heap_span(base, 1_000_000, 250_000, 32));
+            let mut writes = Ranges::default();
+            let at = base + if i % 8 == 0 { 4096 } else { 0x00c0_0000 };
+            writes.insert(at, at + 4096);
+            before += usize::from(writes.intersects(old.0, old.1));
+            after += usize::from(writes.intersects(new.0, new.1));
+        }
+    }
+    assert_eq!(before, HEAPS * SUBMISSIONS);
+    assert_eq!(after, HEAPS * SUBMISSIONS / 8);
 }
 
 /// Split upload copies into disjoint jobs with a bounded byte count. The
@@ -281,6 +318,14 @@ mod telemetry {
     static STALE: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
     static BINDLESS_BUFFERS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
     static DESCRIPTOR_REARMS_DEFERRED: AtomicU64 = AtomicU64::new(0);
+    static BINDLESS_WAITS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+    pub(crate) fn bindless_wait(begin: Instant) {
+        if stats() {
+            BINDLESS_WAITS[0].fetch_add(1, Ordering::Relaxed);
+            BINDLESS_WAITS[1].fetch_add(begin.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
 
     pub(crate) fn descriptor_rearm_deferred() {
         if stats() {
@@ -383,8 +428,9 @@ mod telemetry {
         let [frame_start, later, slots, scheduled] = BINDLESS_BUFFERS.each_ref().map(per_frame);
         let [waves, checks, clean, parallel] = flushes.map(|n| n as f64 / frames);
         tracing::info!(
-            "rf-x9: refreshes/frame[flushes={waves:.1} checks={checks:.1} clean={clean:.1} parallel={parallel:.1}] bindless-buffers/frame[first={frame_start:.1} later={later:.1} slots={slots:.1} refreshes={scheduled:.1}] incremental={}",
-            super::incremental_bindless(),
+            "rf-x9: refreshes/frame[flushes={waves:.1} checks={checks:.1} clean={clean:.1} parallel={parallel:.1}] bindless-buffers/frame[first={frame_start:.1} later={later:.1} slots={slots:.1} refreshes={scheduled:.1} wait-count={:.1} wait-ms={:.3}] submit={} incremental={}",
+            per_frame(&BINDLESS_WAITS[0]), per_frame(&BINDLESS_WAITS[1]) / 1e6,
+            super::bindless_at_submit(), super::incremental_bindless(),
         );
         if super::defer_descriptor_rearm() {
             tracing::info!(

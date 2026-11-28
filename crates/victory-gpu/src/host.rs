@@ -6579,7 +6579,7 @@ impl Host {
             if deferred.x9_heaps_resolved {
                 Vec::new()
             } else {
-                deferred.x9_heap_sweeps.iter().map(|(_, heap)| heap.range()).collect()
+                deferred.x9_heap_sweeps.iter().filter_map(|(_, heap)| heap.mirrored_range()).collect()
             }
         }).collect();
         let waiting = std::time::Instant::now();
@@ -6596,6 +6596,7 @@ impl Host {
                 } else {
                     self.settle(submitted, WHY_READ);
                 }
+                crate::rf_x9::bindless_wait(waiting);
             }
         }
         let waited = waiting.elapsed();
@@ -8800,7 +8801,7 @@ impl HostList {
     }
 
     pub(crate) fn defer_x9_heap_buffers(&self, heap: &crate::descriptor::Heap) -> bool {
-        if !crate::rf_x9::enabled() {
+        if !crate::rf_x9::bindless_at_submit() {
             return false;
         }
         let mut deferred = self.deferred();
