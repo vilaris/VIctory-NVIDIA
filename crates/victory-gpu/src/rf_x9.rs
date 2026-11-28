@@ -18,6 +18,11 @@ pub(crate) fn verify() -> bool {
 /// bytes through the title mapping. Changing/unmapped samples are inconclusive.
 #[cfg(windows)]
 pub(crate) fn verify_memory(class: &'static str, source: usize, destination: usize, len: usize) {
+    verify_memory_at(class, source, source, destination, len);
+}
+
+#[cfg(windows)]
+pub(crate) fn verify_memory_at(class: &'static str, address: usize, source: usize, destination: usize, len: usize) {
     const SAMPLE: usize = 64;
     let n = len.min(SAMPLE);
     if n == 0 {
@@ -33,7 +38,7 @@ pub(crate) fn verify_memory(class: &'static str, source: usize, destination: usi
     {
         tracing::warn!(
             class,
-            address = format_args!("{source:#x}"),
+            address = format_args!("{address:#x}"),
             len,
             sampled = n,
             "rf-x9 diverge"

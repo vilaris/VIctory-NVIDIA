@@ -641,6 +641,21 @@ fn take_with(
                 copy_upload(&moves[starts[job]..starts[job + 1]]);
             }
         });
+        if crate::rf_x9::verify() {
+            for ((shadow, _), copy) in dirty.iter().zip(&copies) {
+                if let Some(&(at, offset, len)) = copy.runs.first() {
+                    // Check the CopyBufferRegion source that the recorded
+                    // command will read, relative to the legacy shadow.
+                    crate::rf_x9::verify_memory_at(
+                        "card-upload",
+                        shadow.span().0 as usize + at,
+                        shadow.card_data() as usize + at,
+                        memory.data + offset as usize,
+                        len,
+                    );
+                }
+            }
+        }
     } else {
         tile_moves.for_each(|m| copy_upload(std::slice::from_ref(&m)));
         crate::land::each_under(pending_work.len(), &one);
