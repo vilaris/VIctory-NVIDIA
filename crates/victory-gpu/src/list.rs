@@ -212,6 +212,7 @@ pub(crate) fn external(this: This, work: External) -> bool {
 #[cfg(windows)]
 fn run_external(this: This, work: External) {
     with_state(this, |host, state| {
+        host.rf_x7_other_work();
         if work(host) {
             state.replay(host);
         }
@@ -252,11 +253,11 @@ fn discard_thin_state(this: This) {
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     let list = host_list_ordered(this)?;
-    list.rf_x7_opaque();
+    list.rf_x7_flush();
     Some(list)
 }
 
-/// A barrier or direct dispatch models its own GPU accesses.
+/// A barrier or a call that can consume a pending barrier itself.
 #[cfg(windows)]
 fn host_list_ordered<'a>(this: This) -> Option<&'a crate::host::HostList> {
     let list = host_list_held(this)?;
@@ -859,7 +860,7 @@ extern "system" fn list_type(this: This) -> u32 {
 extern "system" fn close(this: This) -> HRESULT {
     let _called = crate::timeline::span("the title's Close");
     #[cfg(windows)]
-    if let Some(host) = host_list(this) {
+    if let Some(host) = host_list_ordered(this) {
         host.close();
     }
     S_OK
@@ -1087,7 +1088,7 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
         crate::host::count_gpu_step(crate::host::GpuStep::OurStates, 0);
         // SAFETY: an open list and a live texture.
-        unsafe { crate::rf_x2::barriers(&list.list, "vx:barrier.tex.state", &[barrier]) }; // rf-x2
+        crate::rf_x7::adjacent_title(list, "vx:barrier.tex.state", &[barrier]);
     }
 }
 
@@ -1619,11 +1620,13 @@ extern "system" fn clear_rtv(
 ) {
     #[cfg(windows)]
     {
-        let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
+        let (Some(list), Some(record)) = (host_list_ordered(this), crate::descriptor::rtv_record(handle))
         else {
             return;
         };
-        list.gpu_step(crate::host::GpuStep::Clears, 0);
+        if !crate::rf_x7::narrow() {
+            list.gpu_step(crate::host::GpuStep::Clears, 0);
+        }
         let (Some(texture), Some(host)) = (
             crate::resource::host_resource(record.resource),
             crate::host::host(),
@@ -1644,11 +1647,14 @@ extern "system" fn clear_rtv(
         unsafe {
             if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
                 use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-                crate::rf_x2::barriers(&list.list, "vx:barrier.targets", &[crate::host::transition( // rf-x2
+                crate::rf_x7::adjacent_title(list, "vx:barrier.targets", &[crate::host::transition(
                     texture,
                     State(before as i32),
                     State(RENDER_TARGET as i32),
                 )]);
+            }
+            if crate::rf_x7::narrow() {
+                list.gpu_step(crate::host::GpuStep::Clears, 0);
             }
             list.list.ClearRenderTargetView(rtv, color, rects);
         }
@@ -1743,7 +1749,7 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
 extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     count_dispatch();
     #[cfg(windows)]
-    with_state_on(host_list_ordered(this), this, |list, s| s.dispatch(list, x, y, z, flags));
+    with_state(this, |list, s| s.dispatch(list, x, y, z, flags));
     #[cfg(not(windows))]
     let _ = (this, x, y, z, flags);
 }
@@ -1921,7 +1927,7 @@ extern "system" fn ignored_state(_: This) {}
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
 mod state {
-    use super::{This, with_binding, with_state};
+    use super::{This, host_list_ordered, with_binding, with_state, with_state_on};
     use crate::draw::{IndexView, VertexView};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
@@ -1936,7 +1942,7 @@ mod state {
     }
 
     pub(super) extern "system" fn topology(this: This, topology: u32) {
-        with_state(this, |list, s| s.set_topology(list, topology));
+        with_state_on(host_list_ordered(this), this, |list, s| s.set_topology(list, topology));
     }
     pub(super) extern "system" fn viewports(
         this: This,
@@ -1945,22 +1951,22 @@ mod state {
     ) {
         // (Through the draw state, which keeps them for the host list
         // that continues this one after a cut: `State::replay`.)
-        with_state(this, |list, s| s.set_viewports(list, items(viewports, count)));
+        with_state_on(host_list_ordered(this), this, |list, s| s.set_viewports(list, items(viewports, count)));
     }
     pub(super) extern "system" fn scissors(this: This, count: u32, rects: *const RECT) {
-        with_state(this, |list, s| s.set_scissors(list, items(rects, count)));
+        with_state_on(host_list_ordered(this), this, |list, s| s.set_scissors(list, items(rects, count)));
     }
     pub(super) extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
-        with_state(this, |list, s| {
+        with_state_on(host_list_ordered(this), this, |list, s| {
             // SAFETY: the title passes four floats or null.
             s.set_blend_factor(list, unsafe { factor.as_ref() })
         });
     }
     pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
-        with_state(this, |list, s| s.set_stencil_ref(list, reference));
+        with_state_on(host_list_ordered(this), this, |list, s| s.set_stencil_ref(list, reference));
     }
     pub(super) extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
-        with_state(this, |list, s| s.set_depth_bounds(list, min, max));
+        with_state_on(host_list_ordered(this), this, |list, s| s.set_depth_bounds(list, min, max));
     }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
         with_binding(this, |s| s.set_heaps(items(heaps, count)));
@@ -2043,7 +2049,7 @@ mod state {
         };
         // SAFETY: the title passes a handle or null.
         let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
-        with_state(this, |list, s| s.set_targets(list, &handles, depth));
+        with_state_on(host_list_ordered(this), this, |list, s| s.set_targets(list, &handles, depth));
     }
     pub(super) extern "system" fn draw(
         this: This,
@@ -2053,13 +2059,13 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
-        with_state_on(host_list_ordered(this), this, |list, s| {
+        with_state(this, |list, s| {
             s.draw(list, vertices, instances, first, first_instance)
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
-        with_state_on(host_list_ordered(this), this, |list, s| s.dispatch(list, x, y, z, 0));
+        with_state(this, |list, s| s.dispatch(list, x, y, z, 0));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
@@ -2186,7 +2192,7 @@ extern "system" fn execute_indirect(
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
         with_state_on(host_list_held(this), this, |list, s| {
-            list.rf_x7_opaque();
+            list.rf_x7_flush();
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
     } else {

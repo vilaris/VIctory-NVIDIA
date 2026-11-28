@@ -136,6 +136,9 @@ pub(crate) struct Translated {
     pub(crate) stores: bool,
     /// Whether it can store through raw addresses ([`stores_by_address`]).
     pub(crate) stores_by_address: bool,
+    /// A shader's declared resource heap can hide reads and writes from its
+    /// table binding metadata.
+    pub(crate) rf_x7_bindless: bool,
     /// Whether it stores through a view it picks from the heap by an index,
     /// once asked (`crate::picked`).
     pub(crate) picks: std::sync::atomic::AtomicU8,
@@ -213,6 +216,9 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         _ => None,
     });
     let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
+    let rf_x7_bindless = programs.iter().any(|p| {
+        p.layout.iter().any(|entry| entry.root == victory_shader::native::RootType::ResourceHeap)
+    });
     let used = programs
         .into_iter()
         .find(|p| {
@@ -231,6 +237,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         tables,
         stores,
         stores_by_address,
+        rf_x7_bindless,
         picks: Default::default(),
     })
 }

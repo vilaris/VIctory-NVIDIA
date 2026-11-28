@@ -1,110 +1,30 @@
 //! Resource ordering and barrier attribution for RF X7.
 
-/// A whole-resource access, with an optional conservative range in title memory.
-/// Two shadows of the same title bytes must also be treated as aliases.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Access {
-    resource: u64,
-    start: u64,
-    end: u64,
-    writes: bool,
-    uav: bool,
+/// A global wait covers the imported work at the head of the list and
+/// every subsequent interval that may have touched a UAV.
+struct GlobalWait {
+    dirty: bool,
 }
 
-impl Access {
-    fn overlaps(self, other: Self) -> bool {
-        self.resource == other.resource || self.start < other.end && other.start < self.end
-    }
-
-    fn hazards(self, other: Self) -> bool {
-        (self.writes || other.writes) && self.overlaps(other)
-    }
-}
-
-#[derive(Clone, Default)]
-struct Footprint {
-    accesses: Vec<Access>,
-    unknown: bool,
-}
-
-impl Footprint {
-    fn add(&mut self, access: Access) {
-        if !self.unknown && !self.accesses.contains(&access) {
-            if self.accesses.len() == 128 {
-                self.accesses.clear();
-                self.unknown = true;
-            } else {
-                self.accesses.push(access);
-            }
-        }
-    }
-
-    fn conflicts(&self, next: &Self) -> bool {
-        self.unknown || next.unknown ||
-            self.accesses.iter().any(|&a| next.accesses.iter().any(|&b| a.hazards(b)))
-    }
-
-    fn conservative_conflict(&self, next: &Self) -> bool {
-        self.unknown || next.unknown ||
-            self.accesses.iter().any(|&a| next.accesses.iter().any(|&b| {
-                // Assume every UAV can write and include adjacent title
-                // spans whose bounds the tracker could have underestimated.
-                (a.uav || b.uav || a.writes || b.writes) &&
-                    (a.resource == b.resource || a.start <= b.end && b.start <= a.end)
-            }))
-    }
-}
-
-/// Work before the pending wait and work since the last effective global wait.
-/// Keep both: a later wait can absorb the pending wait and covers more work.
-struct Frontier {
-    all: Footprint,
-    pending: Option<Footprint>,
-}
-
-impl Default for Frontier {
+impl Default for GlobalWait {
     fn default() -> Self {
-        Self { all: Footprint { unknown: true, ..Footprint::default() }, pending: None }
+        Self { dirty: true }
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum Wait {
-    Record,
-    Delay,
-    Merge,
-    Covered,
+impl GlobalWait {
+    fn work(&mut self, uav_access: bool) {
+        self.dirty |= uav_access;
+    }
+
+    fn wait(&mut self) -> bool {
+        std::mem::take(&mut self.dirty)
+    }
 }
 
-impl Frontier {
-    fn wait(&mut self) -> Wait {
-        if self.all.unknown {
-            self.flush();
-            return Wait::Record;
-        }
-        if self.all.accesses.is_empty() && self.pending.is_none() {
-            return Wait::Covered;
-        }
-        let merged = self.pending.is_some();
-        self.pending = Some(self.all.clone());
-        if merged { Wait::Merge } else { Wait::Delay }
-    }
-
-    fn flush(&mut self) -> bool {
-        self.all.accesses.clear();
-        self.all.unknown = false;
-        self.pending.take().is_some()
-    }
-
-    fn record(&mut self, next: Footprint) {
-        if next.unknown {
-            self.all.unknown = true;
-        } else {
-            for access in next.accesses {
-                self.all.add(access);
-            }
-        }
-    }
+/// Returns whether the new wait shares the already pending GPU command.
+fn queue_wait(pending: &mut bool) -> bool {
+    std::mem::replace(pending, true)
 }
 
 fn redundant_transition(before: i32, after: i32, full: bool) -> bool {
@@ -114,7 +34,7 @@ fn redundant_transition(before: i32, after: i32, full: bool) -> bool {
 #[cfg(windows)]
 mod windows_impl {
     use super::*;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::mem::ManuallyDrop;
     use std::panic::Location;
     use std::sync::{Mutex, OnceLock};
@@ -147,7 +67,19 @@ mod windows_impl {
     }
 
     pub(crate) fn tracking() -> bool {
-        switches().title || switches().verify
+        switches().title || switches().verify || narrow()
+    }
+
+    pub(crate) fn possible_uav_access(shaders: Option<&crate::pipeline::host::HostPipeline>) -> bool {
+        shaders.is_none_or(|pipeline| {
+            pipeline.stages.is_empty() || pipeline.stages.iter().any(|stage| {
+                let shader = stage.translated();
+                shader.stores || shader.stores_by_address || shader.rf_x7_bindless
+                    || !stage.root_uavs.is_empty()
+                    || !shader.host.root_indexed_views.is_empty()
+                    || shader.used.iter().any(|view| view.kind == victory_shader::ResourceType::Uav)
+            })
+        })
     }
 
     #[derive(Default)]
@@ -171,6 +103,10 @@ mod windows_impl {
         narrowed: u64,
         scoped_global: u64,
         consecutive: u64,
+        consecutive_calls: u64,
+        within_call: u64,
+        coalesced_calls: u64,
+        coalesced_enhanced: u64,
         draws: u64,
         dispatches: u64,
         gaps: u64,
@@ -178,10 +114,8 @@ mod windows_impl {
         max_dispatches: u64,
         would_omit: u64,
         omitted: u64,
-        conservative_hazards: u64,
-        conservative_omissions: u64,
-        delayed_past_work: u64,
         tracked_work: u64,
+        possible_uav_work: u64,
         gaps_by_list: HashMap<usize, Option<Gap>>,
     }
 
@@ -248,9 +182,73 @@ mod windows_impl {
             s.dispatches += gap.dispatches;
             s.max_draws = s.max_draws.max(gap.draws);
             s.max_dispatches = s.max_dispatches.max(gap.dispatches);
-            s.consecutive += u64::from(gap.draws == 0 && gap.dispatches == 0 && !gap.other);
+            let adjacent = u64::from(gap.draws == 0 && gap.dispatches == 0 && !gap.other);
+            s.consecutive += adjacent;
+            s.consecutive_calls += adjacent;
         }
         s.consecutive += count - 1;
+        s.within_call += count - 1;
+    }
+
+    fn coalesced(count: u64) {
+        stats(|s| s.coalesced_calls += count);
+    }
+
+    pub(crate) fn mark_scoped_global() {
+        stats(|s| s.scoped_global += 1);
+    }
+
+    /// Run two adjacent legacy arrays as one ordered array. The caller
+    /// identifies adjacency at the point of recording, before any work.
+    #[track_caller]
+    pub(crate) fn adjacent_legacy(
+        list: &ID3D12GraphicsCommandList,
+        reason: &'static str,
+        first: &[D3D12_RESOURCE_BARRIER],
+        second: &[D3D12_RESOURCE_BARRIER],
+    ) {
+        // SAFETY: the callers provide an open list and live resources.
+        unsafe {
+            if narrow() && !first.is_empty() && !second.is_empty() {
+                coalesced(1);
+                let batch: Vec<_> = first.iter().chain(second).map(copy_barrier).collect();
+                victory_barriers(list, reason, &batch, None);
+            } else {
+                for barriers in [first, second].into_iter().filter(|b| !b.is_empty()) {
+                    victory_barriers(list, reason, barriers, None);
+                }
+            }
+        }
+    }
+
+    #[track_caller]
+    pub(crate) fn adjacent_title(
+        host: &crate::host::HostList,
+        reason: &'static str,
+        victory: &[D3D12_RESOURCE_BARRIER],
+    ) {
+        let list = &host.list;
+        if !victory.is_empty()
+            && let Some(mut title) = host.rf_x7_title()
+            && title.take_pending()
+        {
+            count_title(&[uav(None)]);
+            coalesced(1);
+            let batch: Vec<_> = std::iter::once(uav(None))
+                .chain(victory.iter().filter(|b| !redundant(b)).map(copy_barrier))
+                .collect();
+            // Count the translated input once per origin. Emit the array once.
+            account_victory(list, Site::at(reason, Location::caller()), victory);
+            stats(|s| s.dropped_transition += (victory.len() + 1 - batch.len()) as u64);
+            unsafe { crate::rf_x2::record_mixed(list, reason, &batch) };
+            return;
+        }
+        unsafe { victory_barriers(list, reason, victory, None) };
+    }
+
+    fn copy_barrier(barrier: &D3D12_RESOURCE_BARRIER) -> D3D12_RESOURCE_BARRIER {
+        // SAFETY: these unions hold borrowed pointers behind ManuallyDrop.
+        unsafe { std::ptr::read(barrier) }
     }
 
     pub(crate) fn title_requests(site: &'static str, named: u64, global: u64) {
@@ -262,12 +260,72 @@ mod windows_impl {
     }
 
     #[track_caller]
-    pub(crate) fn enhanced_globals(groups: &[D3D12_BARRIER_GROUP]) {
+    pub(crate) fn enhanced_globals(list: &ID3D12GraphicsCommandList, groups: &[D3D12_BARRIER_GROUP]) {
         let site = Site::at("vx:barrier.place (enhanced)", Location::caller());
         stats(|s| {
             let count = groups.iter().map(|group| u64::from(group.NumBarriers)).sum::<u64>();
+            boundary(s, list, count);
             *s.globals.entry(site).or_default() += count;
         });
+    }
+
+    /// Merge only global groups whose masks can be unioned without crossing
+    /// a split barrier or a NO_ACCESS region. COMMON already covers all access
+    /// types supported by the combined sync scope.
+    ///
+    /// # Safety
+    /// The group payloads must be live and valid for the Barrier call.
+    pub(crate) unsafe fn merge_global_groups(groups: &[D3D12_BARRIER_GROUP]) -> Option<D3D12_GLOBAL_BARRIER> {
+        if !narrow() || groups.iter().any(|g| g.Type != D3D12_BARRIER_TYPE_GLOBAL) {
+            return None;
+        }
+        let count = groups.iter().map(|g| u64::from(g.NumBarriers)).sum::<u64>();
+        if count < 2 {
+            return None;
+        }
+        let mut merged: Option<D3D12_GLOBAL_BARRIER> = None;
+        for group in groups.iter().filter(|g| g.NumBarriers != 0) {
+            // SAFETY: the caller's Barrier group and its payload are live.
+            let globals = unsafe { std::slice::from_raw_parts(group.Anonymous.pGlobalBarriers, group.NumBarriers as usize) };
+            for b in globals {
+                if b.SyncBefore.0 & D3D12_BARRIER_SYNC_SPLIT.0 != 0
+                    || b.SyncAfter.0 & D3D12_BARRIER_SYNC_SPLIT.0 != 0
+                    || b.AccessBefore == D3D12_BARRIER_ACCESS_NO_ACCESS
+                    || b.AccessAfter == D3D12_BARRIER_ACCESS_NO_ACCESS
+                    || b.SyncBefore == D3D12_BARRIER_SYNC_NONE
+                    || b.SyncAfter == D3D12_BARRIER_SYNC_NONE
+                {
+                    return None;
+                }
+                merged = Some(match merged {
+                    None => *b,
+                    Some(a) => D3D12_GLOBAL_BARRIER {
+                        SyncBefore: union_sync(a.SyncBefore, b.SyncBefore),
+                        SyncAfter: union_sync(a.SyncAfter, b.SyncAfter),
+                        AccessBefore: union_access(a.AccessBefore, b.AccessBefore),
+                        AccessAfter: union_access(a.AccessAfter, b.AccessAfter),
+                    },
+                });
+            }
+        }
+        stats(|s| s.coalesced_enhanced += count - 1);
+        merged
+    }
+
+    fn union_sync(a: D3D12_BARRIER_SYNC, b: D3D12_BARRIER_SYNC) -> D3D12_BARRIER_SYNC {
+        if a == D3D12_BARRIER_SYNC_ALL || b == D3D12_BARRIER_SYNC_ALL {
+            D3D12_BARRIER_SYNC_ALL
+        } else {
+            a | b
+        }
+    }
+
+    fn union_access(a: D3D12_BARRIER_ACCESS, b: D3D12_BARRIER_ACCESS) -> D3D12_BARRIER_ACCESS {
+        if a == D3D12_BARRIER_ACCESS_COMMON || b == D3D12_BARRIER_ACCESS_COMMON {
+            D3D12_BARRIER_ACCESS_COMMON
+        } else {
+            a | b
+        }
     }
 
     fn redundant(b: &D3D12_RESOURCE_BARRIER) -> bool {
@@ -353,19 +411,7 @@ mod windows_impl {
         scope: Option<ClampScope<'_>>,
     ) {
         let site = Site::at(reason, Location::caller());
-        stats(|s| {
-            boundary(s, list, barriers.len() as u64);
-            for b in barriers {
-                if b.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION {
-                    // SAFETY: selected by Type.
-                    let t = unsafe { &b.Anonymous.Transition };
-                    *s.transitions.entry((site, t.StateBefore.0, t.StateAfter.0)).or_default() += 1;
-                    s.redundant += u64::from(redundant(b));
-                } else if is_global(b) {
-                    *s.globals.entry(site).or_default() += 1;
-                }
-            }
-        });
+        account_victory(list, site, barriers);
         if !narrow() || scope.is_none() && !barriers.iter().any(redundant) {
             unsafe { crate::rf_x2::record_barriers(list, reason, barriers) };
             return;
@@ -394,7 +440,7 @@ mod windows_impl {
                 }
                 // The original array continues to own all its pointers.
                 // ResourceBarrier structs have no active automatic COM drops.
-                actual.push(unsafe { std::ptr::read(b) });
+                actual.push(copy_barrier(b));
             }
         }
         stats(|s| {
@@ -407,12 +453,28 @@ mod windows_impl {
         }
     }
 
+    fn account_victory(list: &ID3D12GraphicsCommandList, site: Site, barriers: &[D3D12_RESOURCE_BARRIER]) {
+        stats(|s| {
+            boundary(s, list, barriers.len() as u64);
+            for b in barriers {
+                if b.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION {
+                    // SAFETY: selected by Type.
+                    let t = unsafe { &b.Anonymous.Transition };
+                    *s.transitions.entry((site, t.StateBefore.0, t.StateAfter.0)).or_default() += 1;
+                    s.redundant += u64::from(redundant(b));
+                } else if is_global(b) {
+                    *s.globals.entry(site).or_default() += 1;
+                }
+            }
+        });
+    }
+
     fn is_global(b: &D3D12_RESOURCE_BARRIER) -> bool {
         // SAFETY: the type selects the union member.
         b.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV && unsafe { b.Anonymous.UAV.pResource.is_none() }
     }
 
-    fn emit_title(list: &ID3D12GraphicsCommandList, barriers: &[D3D12_RESOURCE_BARRIER]) {
+    fn count_title(barriers: &[D3D12_RESOURCE_BARRIER]) {
         stats(|s| {
             for b in barriers.iter().filter(|b| b.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV) {
                 if is_global(b) {
@@ -422,6 +484,10 @@ mod windows_impl {
                 }
             }
         });
+    }
+
+    fn emit_title(list: &ID3D12GraphicsCommandList, barriers: &[D3D12_RESOURCE_BARRIER]) {
+        count_title(barriers);
         // SAFETY: the recording is open and every resource pointer is live.
         unsafe { crate::rf_x2::title_barriers(list, barriers) };
     }
@@ -458,126 +524,88 @@ mod windows_impl {
             title_sites = ?s.title_requests, victory_global = global_count, victory_transition = transition_count,
             redundant_transition = s.redundant, dropped_transition = s.dropped_transition,
             narrowed_global = s.narrowed, scoped_global = s.scoped_global,
-            consecutive = s.consecutive, gaps = s.gaps, draws_between = s.draws, dispatches_between = s.dispatches,
+            consecutive = s.consecutive, consecutive_calls = s.consecutive_calls,
+            within_call = s.within_call, coalesced_calls = s.coalesced_calls,
+            coalesced_enhanced = s.coalesced_enhanced,
+            gaps = s.gaps, draws_between = s.draws, dispatches_between = s.dispatches,
             max_draws_between = s.max_draws, max_dispatches_between = s.max_dispatches,
-            would_omit = s.would_omit, omitted = s.omitted, delayed_past_work = s.delayed_past_work,
-            tracked_work = s.tracked_work, conservative_hazards = s.conservative_hazards,
-            conservative_omissions = s.conservative_omissions,
+            would_omit = s.would_omit, omitted = s.omitted,
+            tracked_work = s.tracked_work, possible_uav_work = s.possible_uav_work,
             top_global = ?top_global, top_transition = ?top_transition, top_pairs = ?top_pairs,
             globals_by_site = ?s.globals, transitions_by_site_and_state = ?s.transitions,
             "rf-x7:"
         );
     }
 
-    /// Just the narrow set of commands with immutable, bounded bindings
-    /// participates in the prediction. Any other command seals the window.
+    /// A legacy global wait may remain pending only until the next call
+    /// that could record GPU work. It owns no resource or borrowed data.
     #[derive(Default)]
     pub(crate) struct Title {
-        frontier: Frontier,
-        current: Option<Footprint>,
-        ordered_named: HashSet<u64>,
-        pending_conservative_hits: u64,
+        wait: GlobalWait,
+        pending: bool,
     }
 
     impl Title {
-        fn flush(&mut self, list: &ID3D12GraphicsCommandList) {
-            if self.frontier.flush() && !switches().verify {
+        pub(crate) fn flush(&mut self, list: &ID3D12GraphicsCommandList) {
+            if std::mem::take(&mut self.pending) {
                 emit_title(list, &[uav(None)]);
             }
-            self.pending_conservative_hits = 0;
         }
 
-        pub(crate) fn opaque(&mut self, list: &ID3D12GraphicsCommandList) {
+        pub(crate) fn work(&mut self, list: &ID3D12GraphicsCommandList, uav_access: bool) {
             self.flush(list);
-            self.frontier.all.unknown = true;
-            self.current = None;
-            self.ordered_named.clear();
+            self.wait.work(uav_access);
         }
 
-        pub(crate) fn begin(&mut self, list: &ID3D12GraphicsCommandList, known: bool) {
-            if known {
-                self.current = Some(Footprint::default());
-            } else {
-                self.opaque(list);
-            }
+        pub(crate) fn shader_work(&mut self, list: &ID3D12GraphicsCommandList, uav_access: bool) {
+            stats(|s| {
+                s.tracked_work += 1;
+                s.possible_uav_work += u64::from(uav_access);
+            });
+            self.work(list, uav_access);
         }
 
-        pub(crate) fn root(&mut self, shadow: &crate::shadow::Shadow, writes: bool, uav: bool) {
-            if let Some(current) = &mut self.current {
-                let (start, len) = shadow.span();
-                current.add(Access {
-                    resource: shadow.buffer.as_raw() as u64,
-                    start,
-                    end: start.saturating_add(len),
-                    writes,
-                    uav,
-                });
-            }
+        /// Return the pending global to a caller that can record it in the
+        /// same array as the next barrier, with no work in between.
+        pub(crate) fn take_pending(&mut self) -> bool {
+            std::mem::take(&mut self.pending)
         }
 
-        pub(crate) fn shader_work(&mut self, list: &ID3D12GraphicsCommandList) {
-            let Some(next) = self.current.take() else { return };
-            stats(|s| s.tracked_work += u64::from(!next.unknown));
-            if next.unknown {
-                self.ordered_named.clear();
-            } else {
-                for access in &next.accesses {
-                    self.ordered_named.remove(&access.resource);
-                }
-            }
-            if let Some(before) = &self.frontier.pending {
-                if before.conflicts(&next) {
-                    self.flush(list);
-                } else {
-                    let conservative = u64::from(switches().verify && before.conservative_conflict(&next));
-                    self.pending_conservative_hits += conservative;
-                    stats(|s| {
-                        s.delayed_past_work += 1;
-                        s.conservative_hazards += conservative;
-                    });
-                }
-            }
-            self.frontier.record(next);
-        }
-
-        fn barriers(&mut self, host: &crate::host::HostList, barriers: &[D3D12_RESOURCE_BARRIER]) {
-            let list = &host.list;
+        fn barriers(&mut self, list: &ID3D12GraphicsCommandList, barriers: &[D3D12_RESOURCE_BARRIER]) {
             if barriers.len() == 1 && is_global(&barriers[0]) && plain_uav(&barriers[0]) {
-                self.ordered_named.clear();
-                let had_pending = self.frontier.pending.is_some();
-                let wait = self.frontier.wait();
-                if matches!(wait, Wait::Merge | Wait::Covered) || had_pending && wait == Wait::Record {
-                    omitted();
-                    let hits = std::mem::take(&mut self.pending_conservative_hits);
-                    stats(|s| s.conservative_omissions += hits);
-                }
-                if switches().verify || wait == Wait::Record {
-                    emit_title(list, barriers);
-                }
-            } else if barriers.iter().all(plain_uav) && barriers.iter().all(|b| !is_global(b)) {
-                if self.frontier.pending.is_some() {
-                    self.flush(list);
-                    self.ordered_named.clear();
-                }
-                let mut actual = Vec::with_capacity(barriers.len());
-                for b in barriers {
-                    // SAFETY: plain_uav checked the union member. Keep it
-                    // alive until reset, including across adjacent calls.
-                    let Some(resource) = (unsafe { b.Anonymous.UAV.pResource.as_ref() }) else { continue };
-                    if self.ordered_named.insert(resource.as_raw() as u64) {
-                        host.keep(resource);
-                        actual.push(uav(Some(resource)));
-                    } else {
+                if switches().title || switches().verify {
+                    let required = self.wait.wait();
+                    if !required {
                         omitted();
                     }
-                }
-                if switches().verify {
-                    emit_title(list, barriers);
-                } else if !actual.is_empty() {
-                    emit_title(list, &actual);
+                    if switches().verify || required {
+                        self.global(list, barriers);
+                    }
+                } else {
+                    self.global(list, barriers);
                 }
             } else {
-                self.opaque(list);
+                if barriers.iter().any(|b| is_global(b) && plain_uav(b)) {
+                    self.wait.wait();
+                }
+                if self.take_pending() {
+                    let mut actual = Vec::with_capacity(1 + barriers.len());
+                    actual.push(uav(None));
+                    actual.extend(barriers.iter().map(copy_barrier));
+                    coalesced(1);
+                    emit_title(list, &actual);
+                } else {
+                    emit_title(list, barriers);
+                }
+            }
+        }
+
+        fn global(&mut self, list: &ID3D12GraphicsCommandList, barriers: &[D3D12_RESOURCE_BARRIER]) {
+            if narrow() && !switches().verify {
+                if queue_wait(&mut self.pending) {
+                    coalesced(1);
+                }
+            } else {
                 emit_title(list, barriers);
             }
         }
@@ -597,7 +625,7 @@ mod windows_impl {
     pub(crate) fn title_barriers(host: &crate::host::HostList, barriers: &[D3D12_RESOURCE_BARRIER]) {
         stats(|s| boundary(s, &host.list, barriers.len() as u64));
         if let Some(mut title) = host.rf_x7_title() {
-            title.barriers(host, barriers);
+            title.barriers(&host.list, barriers);
         } else {
             emit_title(&host.list, barriers);
         }
@@ -611,80 +639,32 @@ pub(crate) use windows_impl::*;
 mod tests {
     use super::*;
 
-    fn access(resource: u64, start: u64, end: u64, writes: bool) -> Access {
-        Access { resource, start, end, writes, uav: writes }
-    }
-
-    fn footprint(access: Access) -> Footprint {
-        let mut result = Footprint::default();
-        result.add(access);
-        result
+    #[test]
+    fn keeps_first_wait_and_skips_read_only_shader_intervals() {
+        let mut wait = GlobalWait::default();
+        assert!(wait.wait());
+        wait.work(false);
+        wait.work(false);
+        assert!(!wait.wait());
     }
 
     #[test]
-    fn detects_raw_war_waw_and_aliases() {
-        let read = access(1, 0, 100, false);
-        let write = access(1, 0, 100, true);
-        let alias = access(2, 75, 200, true);
-        let disjoint = access(3, 100, 300, true);
-        assert!(read.hazards(write));
-        assert!(write.hazards(read));
-        assert!(write.hazards(write));
-        assert!(read.hazards(alias));
-        assert!(!read.hazards(read));
-        assert!(!read.hazards(disjoint));
-        assert!(write.hazards(access(1, 900, 950, false)));
+    fn keeps_wait_after_possible_uav_use_or_unclassified_work() {
+        let mut wait = GlobalWait::default();
+        assert!(wait.wait());
+        wait.work(true);
+        wait.work(false);
+        assert!(wait.wait());
+        assert!(!wait.wait());
     }
 
     #[test]
-    fn retains_first_wait_and_joins_consecutive_waits() {
-        let mut f = Frontier::default();
-        assert_eq!(f.wait(), Wait::Record);
-        assert_eq!(f.wait(), Wait::Covered);
-        f.record(footprint(access(1, 0, 100, true)));
-        assert_eq!(f.wait(), Wait::Delay);
-        assert_eq!(f.wait(), Wait::Merge);
-        assert!(f.flush());
-        assert!(!f.flush());
-    }
-
-    #[test]
-    fn delays_through_independent_work_and_carries_all_writers_forward() {
-        let mut f = Frontier::default();
-        let a = access(1, 0, 100, true);
-        let b = access(2, 200, 300, true);
-        assert_eq!(f.wait(), Wait::Record);
-        f.record(footprint(a));
-        assert_eq!(f.wait(), Wait::Delay);
-        let next = footprint(b);
-        assert!(!f.pending.as_ref().unwrap().conflicts(&next));
-        f.record(next);
-        assert_eq!(f.wait(), Wait::Merge);
-        let pending = f.pending.as_ref().unwrap();
-        assert!(pending.conflicts(&footprint(Access { writes: false, ..a })));
-        assert!(pending.conflicts(&footprint(Access { writes: false, ..b })));
-        assert!(f.flush());
-    }
-
-    #[test]
-    fn always_conflicts_with_untracked_work() {
-        let mut f = Frontier::default();
-        assert_eq!(f.wait(), Wait::Record);
-        f.record(footprint(access(1, 0, 100, true)));
-        assert_eq!(f.wait(), Wait::Delay);
-        let unknown = Footprint { unknown: true, ..Footprint::default() };
-        assert!(f.pending.as_ref().unwrap().conflicts(&unknown));
-        assert!(f.flush());
-        f.record(unknown);
-        assert_eq!(f.wait(), Wait::Record);
-    }
-
-    #[test]
-    fn verification_counts_possible_uav_writes_and_boundary_aliases() {
-        let before = footprint(Access { uav: true, ..access(1, 0, 100, false) });
-        let after = footprint(access(2, 100, 200, false));
-        assert!(!before.conflicts(&after));
-        assert!(before.conservative_conflict(&after));
+    fn joins_globals_only_while_a_wait_is_pending() {
+        let mut pending = false;
+        assert!(!queue_wait(&mut pending));
+        assert!(queue_wait(&mut pending));
+        assert!(std::mem::take(&mut pending));
+        assert!(!queue_wait(&mut pending));
     }
 
     #[test]

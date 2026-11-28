@@ -7692,10 +7692,16 @@ impl HostList {
         self.rf_x7.as_ref().map(|title| title.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
-    /// Unknown GPU work or a physical list boundary ends the tracked interval.
-    pub(crate) fn rf_x7_opaque(&self) {
+    pub(crate) fn rf_x7_flush(&self) {
         if let Some(mut title) = self.rf_x7_title() {
-            title.opaque(&self.list);
+            title.flush(&self.list);
+        }
+    }
+
+    /// Auxiliary work whose accesses are outside the shader binding metadata.
+    pub(crate) fn rf_x7_other_work(&self) {
+        if let Some(mut title) = self.rf_x7_title() {
+            title.work(&self.list, true);
         }
     }
 
@@ -7703,7 +7709,10 @@ impl HostList {
     /// work's key changes ([`gpu_time`]): draws keep one until the render
     /// targets change ([`Self::gpu_pass_break`]), each compute pipeline's
     /// run of dispatches is one. `name` is asked only for a new pass.
-    pub(crate) fn gpu_pass(&self, compute: bool, pipeline: usize, command: render_trace::Command, name: impl FnOnce() -> String) {
+    pub(crate) fn gpu_pass(&self, compute: bool, pipeline: usize, shaders: Option<&crate::pipeline::host::HostPipeline>, command: render_trace::Command, name: impl FnOnce() -> String) {
+        if let Some(mut title) = self.rf_x7_title() {
+            title.shader_work(&self.list, crate::rf_x7::possible_uav_access(shaders));
+        }
         crate::rf_x7::work(&self.list, Some(compute)); // rf-x7
         crate::rf_x2::title_work(self); // rf-x2
         self.gpu_time.work();
@@ -7738,6 +7747,7 @@ impl HostList {
     /// barrier is work ([`Self::gpu_work`]).
     pub(crate) fn gpu_step(&self, kind: gpu_time::Step, bytes: u64) {
         if !matches!(kind, gpu_time::Step::Transitions | gpu_time::Step::ShaderWrites) {
+            self.rf_x7_other_work();
             crate::rf_x7::work(&self.list, None); // rf-x7
             self.gpu_time.work();
         }
@@ -7750,6 +7760,7 @@ impl HostList {
 
     /// Work was recorded into the list (for list start timing).
     pub(crate) fn gpu_work(&self) {
+        self.rf_x7_other_work();
         self.gpu_time.work();
     }
 
@@ -7853,12 +7864,13 @@ impl HostList {
         let _closing = crate::timeline::span("closing a host list");
         self.left_open[0].store(0, Ordering::Release);
         self.flush_indirect();
-        self.rf_x7_opaque(); // rf-x7
         if self.twins.lock().unwrap_or_else(|e| e.into_inner()).values().any(|u| u.behind[0] == Some(true) || u.late) {
+            self.rf_x7_flush();
             self.gpu_pass_ours(1, "ours: depth twins at the list's end");
             self.twins_to_depth();
         }
         if !self.deferred().back_wanted.is_empty() {
+            self.rf_x7_flush();
             self.gpu_pass_ours(2, "ours: textures copied back at the list's end");
             self.textures_back();
         }
@@ -7880,6 +7892,7 @@ impl HostList {
                 self.batches_common(None);
             }
         }
+        self.rf_x7_flush();
         self.card_budget_out();
         self.take_coming();
         self.water_timing.resolve(&self.list);
@@ -7970,6 +7983,7 @@ impl HostList {
             return true;
         }
         FRESH_OPEN[2].fetch_add(1, Ordering::Relaxed);
+        self.rf_x7_flush();
         // SAFETY: our list, open; what went into it goes with the reset.
         crate::rf_x2::Recording::close(self.rf_x2.as_deref(), &self.list); // rf-x2
         let _ = unsafe { self.list.Close() };
@@ -8126,11 +8140,13 @@ impl HostList {
             && let Some(held) = held.take()
         {
             self.holding.store(false, Ordering::Relaxed);
-            self.rf_x7_opaque(); // rf-x7
             // (an indirect execution: shader work)
             if render_trace::active() {
-                self.gpu_pass(run.kind == 2, run.pipeline, render_trace::Command("execute_indirect_merged", [run.kind.into(), run.records.into(), run.at as i64, 0, run.step.into()]), || format!("indirect pipeline {:#x}", run.pipeline));
+                self.gpu_pass(run.kind == 2, run.pipeline, None, render_trace::Command("execute_indirect_merged", [run.kind.into(), run.records.into(), run.at as i64, 0, run.step.into()]), || format!("indirect pipeline {:#x}", run.pipeline));
             } else {
+                if let Some(mut title) = self.rf_x7_title() {
+                    title.shader_work(&self.list, true);
+                }
                 crate::rf_x2::title_work(self); // rf-x2
                 crate::rf_x7::work(&self.list, Some(run.kind == 2)); // rf-x7
                 self.gpu_time.work();
@@ -8194,6 +8210,12 @@ impl HostList {
     /// records the barrier: for textures that are not a title resource's
     /// host copy (colour twins) and for the copies between the two.
     fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
+        if let Some(barrier) = self.settle_barrier(copy, wanted) {
+            crate::rf_x7::adjacent_title(self, "vx:barrier.tex.state", &[barrier]);
+        }
+    }
+
+    fn settle_barrier(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) -> Option<D3D12_RESOURCE_BARRIER> {
         let wanted = legal_for(copy.flags(), wanted);
         self.changed_something();
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
@@ -8207,15 +8229,22 @@ impl HostList {
                 (before != wanted).then_some(before)
             }
         };
-        drop(states);
-        if let Some(before) = before {
-            let barrier = transition(
+        before.map(|before| transition(
                 &copy.texture,
                 D3D12_RESOURCE_STATES(before as i32),
                 D3D12_RESOURCE_STATES(wanted as i32),
-            );
-            // SAFETY: an open list and a live texture.
-            unsafe { crate::rf_x2::barriers(&self.list, "vx:barrier.tex.state", &[barrier]) }; // rf-x2
+        ))
+    }
+
+    /// Both textures are live. No work separates the two transitions.
+    fn settle_pair(&self, (first, before): (&std::sync::Arc<crate::resource::HostTexture>, u32), (second, after): (&std::sync::Arc<crate::resource::HostTexture>, u32)) {
+        if crate::rf_x7::narrow() {
+            let first = self.settle_barrier(first, before);
+            let second = self.settle_barrier(second, after);
+            crate::rf_x7::adjacent_legacy(&self.list, "vx:barrier.tex.state", first.as_slice(), second.as_slice());
+        } else {
+            self.settle(first, before);
+            self.settle(second, after);
         }
     }
 
@@ -8316,8 +8345,7 @@ impl HostList {
         const PIXEL_SHADER_RESOURCE: u32 = 0x80;
         let Some(plane) = &twin.plane else { return };
         let _rf_x2 = crate::rf_x2::range(&self.list, "vx:tex.depth"); // rf-x2
-        self.settle(depth, DEPTH_WRITE);
-        self.settle(plane, PIXEL_SHADER_RESOURCE);
+        self.settle_pair((depth, DEPTH_WRITE), (plane, PIXEL_SHADER_RESOURCE));
         record_plane_pass(&self.list, &depth.texture, &plane.texture);
         self.settle(plane, UNORDERED_ACCESS);
     }
@@ -8339,8 +8367,8 @@ impl HostList {
         } else {
             (&twin.colour, depth)
         };
-        self.settle(from, COPY_SOURCE);
-        self.settle(to, COPY_DEST);
+        self.settle_pair((from, COPY_SOURCE), (to, COPY_DEST));
+        self.rf_x7_other_work();
         record_twin_copy(&self.list, &depth.texture, twin, colour);
         self.settle(&twin.colour, UNORDERED_ACCESS);
     }
@@ -8523,11 +8551,6 @@ impl HostList {
         if barriers.is_empty() && syncs.is_empty() && uploads.is_empty() {
             return None;
         }
-        if crate::rf_x7::narrow() && !aliasing.is_empty() {
-            // Consecutive barriers: alias first, then transition to the
-            // copy states, in the same order the separate calls used.
-            aliasing.append(&mut to_copy);
-        }
         let mut held = self.prelude.lock().unwrap_or_else(|e| e.into_inner());
         if held.is_none() {
             let kept = if prelude_pool() { PRELUDES.lock().unwrap_or_else(|e| e.into_inner()).pop() } else { None };
@@ -8548,12 +8571,7 @@ impl HostList {
                 list.Reset(allocator, None)?;
                 crate::rf_x2::open(list, crate::rf_x2::Origin::Prelude); // rf-x2
                 let mut timed = gpu_time::Ours::begin(list, "ours: a list's state prelude (states, depth twins)");
-                if !aliasing.is_empty() {
-                    crate::rf_x2::barriers(list, "vx:barrier.prelude", &aliasing); // rf-x2
-                }
-                if !to_copy.is_empty() {
-                    crate::rf_x2::barriers(list, "vx:barrier.prelude", &to_copy); // rf-x2
-                }
+                crate::rf_x7::adjacent_legacy(list, "vx:barrier.prelude", &aliasing, &to_copy);
                 for (depth, twin, colour) in &syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
                 }
@@ -9103,7 +9121,7 @@ impl HostList {
         if !barriers.is_empty() {
             // SAFETY: an open list and live buffers this recording left in
             // `INDIRECT_ARGUMENT`.
-            unsafe { crate::rf_x2::barriers(&self.list, "vx:barrier.indirect", &barriers) }; // rf-x2
+            crate::rf_x7::adjacent_title(self, "vx:barrier.indirect", &barriers);
         }
     }
 
@@ -9117,7 +9135,7 @@ impl HostList {
         if let Some(barrier) = self.take_indirect_common(scratch) {
             // SAFETY: an open list and a live buffer this recording left in
             // `INDIRECT_ARGUMENT`.
-            unsafe { crate::rf_x2::barriers(&self.list, "vx:barrier.indirect", &[barrier]) }; // rf-x2
+            crate::rf_x7::adjacent_title(self, "vx:barrier.indirect", &[barrier]);
         }
     }
 

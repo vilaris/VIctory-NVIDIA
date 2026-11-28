@@ -440,6 +440,7 @@ fn clamp_into(
     ahead: bool,
 ) -> bool {
     let before = list.indirect_state(dst);
+    list.rf_x7_other_work();
     list.trace_gpu_pass("indirect argument clamp", [spec.0.into(), spec.1.into(), spec.2.into(), i64::from(ahead), 0]);
     let scope = crate::rf_x7::narrow().then(|| list.rf_x7_budget()).flatten();
     let recorded = record_clamp(c, &list.list, (dst, before), (budget, scope), src, count, spec, ahead);
@@ -630,6 +631,7 @@ pub(crate) fn open_batch(
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
+    list.rf_x7_other_work();
     list.trace_gpu_pass("indirect argument clamp batch", [0; 5]);
     let scope = crate::rf_x7::narrow().then(|| list.rf_x7_budget()).flatten().map(|budget| {
         crate::rf_x7::ClampScope { inputs: &source_buffers, budget }
