@@ -3959,6 +3959,10 @@ impl Shadow {
         (self.start, self.len)
     }
 
+    pub(crate) fn is_window(&self) -> bool {
+        self.window
+    }
+
     /// The offset of a title address in the copy, if it lies in it.
     pub(crate) fn offset_in(&self, address: u64) -> Option<u64> {
         address.checked_sub(self.start).filter(|&at| at < self.len)
@@ -4095,6 +4099,7 @@ impl Shadow {
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        list.rf_x3_write(self, len.min(self.left(address)));
         // In place the shaders write title memory itself: no snapshot, no
         // compare, nothing to copy back, and no wait on its account.
         // shortcut: another host copy of the same bytes (a title buffer
@@ -4928,17 +4933,76 @@ impl Shadow {
     /// given (`kept`: [`crate::watch::kept_covers`], or a submission's copy of
     /// that asking, [`crate::watch::kept_covers_cached`]). Asks nothing under
     /// a lock but what `kept` does.
-    pub(crate) fn fast_nothing_new_known(&self, address: usize, len: usize, mut kept: impl FnMut(usize, usize) -> bool) -> bool {
+    pub(crate) fn fast_nothing_new_known(&self, address: usize, len: usize, kept: impl FnMut(usize, usize) -> bool) -> bool {
+        let mode = crate::rf_x3::fastskip();
+        if mode != crate::rf_x3::FastSkip::Off {
+            let started = crate::rf_x3::timer();
+            if self.rf_x3_guard_clean(address, len) {
+                crate::rf_x3::checked(started, crate::rf_x3::Check::FastSkip);
+                if mode == crate::rf_x3::FastSkip::On {
+                    return true;
+                }
+                let started = crate::rf_x3::timer();
+                let result = self.legacy_fast_nothing_new_known(address, len, kept);
+                crate::rf_x3::checked(started, crate::rf_x3::Check::Verify);
+                if !result {
+                    crate::rf_x3::verification_miss(self.id, address, len);
+                }
+                return result;
+            }
+            crate::rf_x3::checked(started, crate::rf_x3::Check::FastMiss);
+        }
+        self.legacy_fast_nothing_new_known(address, len, kept)
+    }
+
+    /// A subset of the existing published-guard memo. Cache misses, ranges
+    /// spanning blocks, writes and uncertainty keep the legacy proof.
+    pub(crate) fn rf_x3_guard_clean(&self, address: usize, len: usize) -> bool {
+        if self.watched.load(Ordering::Relaxed) != GUARDED
+            || self.carded()
+            || self.written()
+            || self.pending_len.load(Ordering::Acquire) != 0
+        {
+            return false;
+        }
+        let Some(to) = address.checked_add(len) else {
+            return false;
+        };
+        let slot = &self.clean[0];
+        let revision = slot.revision.load(Ordering::Acquire);
+        let saved = slot.sig.load(Ordering::Acquire);
+        if revision % 2 != 0 || saved == 0 {
+            return false;
+        }
+        let from = slot.from.load(Ordering::Relaxed) as usize;
+        let end = slot.to.load(Ordering::Relaxed) as usize;
+        if address < from || to > end {
+            return false;
+        }
+        crate::inplace::level() == 0 && crate::watch::rf_x3_guard_sig(from, end)
+            .is_some_and(|current| crate::rf_x3::clean_matches((from, end), (address, to), saved, current))
+            && slot.sig.load(Ordering::Acquire) == saved
+            && slot.revision.load(Ordering::Acquire) == revision
+            && self.pending_len.load(Ordering::Acquire) == 0
+            && !self.written()
+    }
+
+    fn legacy_fast_nothing_new_known(&self, address: usize, len: usize, mut kept: impl FnMut(usize, usize) -> bool) -> bool {
+        use crate::rf_x3::{Check, checked, timer};
+        let started = timer();
         if self.place.is_some() {
+            checked(started, Check::EarlyIneligible);
             return true;
         }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), address.saturating_add(len).min(end));
         if from >= to {
+            checked(started, Check::EarlyIneligible);
             return true;
         }
         let watched = self.watched.load(Ordering::Relaxed);
         if !matches!(watched, 1 | GUARDED) || self.pending_len.load(Ordering::Acquire) != 0 {
+            checked(started, Check::EarlyIneligible);
             return false;
         }
         let mut known_cache = None;
@@ -4953,19 +5017,26 @@ impl Shadow {
             if from < cf || to > ct {
                 continue;
             }
-            let known = *known_cache.get_or_insert_with(|| {
-                (watched == GUARDED && crate::watch::published(from, to)) || kept(from, to)
+            let reason = *known_cache.get_or_insert_with(|| {
+                if watched == GUARDED && crate::watch::published(from, to) {
+                    Some(Check::MemoGuard)
+                } else {
+                    kept(from, to).then_some(Check::MemoKept)
+                }
             });
-            if !known {
+            let Some(reason) = reason else {
+                checked(started, Check::MemoMiss);
                 return false;
-            }
+            };
             if crate::watch::block_write_sig(cf, ct).is_some_and(|(sig, _)| sig == cs)
                 && slot.sig.load(Ordering::Acquire) == cs
                 && slot.revision.load(Ordering::Acquire) == revision
             {
+                checked(started, reason);
                 return true;
             }
         }
+        checked(started, Check::MemoMiss);
         false
     }
 
@@ -5075,6 +5146,12 @@ impl Shadow {
             }
             return true;
         }
+        self.nothing_new_after_memo(address, len)
+    }
+
+    /// Legacy fallback after the quick memo misses. The copied stamps
+    /// still have to agree with the current watch answer.
+    pub(crate) fn nothing_new_after_memo(&self, address: usize, len: usize) -> bool {
         if self.place.is_some() {
             return true;
         }
@@ -5234,6 +5311,9 @@ impl Shadow {
             REFRESHED[2].fetch_add(never, Relaxed);
             REFRESHED[3].fetch_add(again, Relaxed);
             REFRESHED[4].fetch_add(u64::from(from % PAGE != 0) + u64::from(to % PAGE != 0 && to != end), Relaxed);
+            if again != 0 && crate::rf_x3::enabled() {
+                crate::rf_x3::rewatched(crate::rf_x3::Object::shadow(self));
+            }
         }
         // Noted before the bytes go in, under the same lock: no other refresh
         // of the copy looks at the notes before they are.

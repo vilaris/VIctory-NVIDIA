@@ -1435,8 +1435,25 @@ impl Staging {
         let _texture = crate::timeline::span("a texture's refresh");
         let read = self.refresh_now();
         let preparing = &crate::host::PREPARING;
-        preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+        let us = started.elapsed().as_micros() as u64;
+        preparing[2].fetch_add(us, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
+        if crate::rf_x3::enabled() {
+            crate::rf_x3::work(self.rf_x3_object(), crate::rf_x3::Source::TextureRefresh, read as u64, us);
+        }
+    }
+
+    fn rf_x3_object(&self) -> crate::rf_x3::Object {
+        crate::rf_x3::Object::new(self.memory as u64, self.layout.size, crate::rf_x3::Kind::Texture)
+    }
+
+    fn digest(&self, bytes: &[u8]) -> Digest {
+        let started = crate::rf_x3::timer();
+        let hash = digest(bytes);
+        if let Some(started) = started {
+            crate::rf_x3::work(self.rf_x3_object(), crate::rf_x3::Source::TextureDigest, bytes.len() as u64, crate::rf_x3::elapsed(started));
+        }
+        hash
     }
 
     fn movie_plane(&self) -> bool {
@@ -1576,7 +1593,7 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                let hash = digest(read);
+                let hash = self.digest(read);
                 if last.hash == Some(hash) {
                     return false;
                 }
@@ -1602,7 +1619,7 @@ impl Staging {
         // view becomes one of those before the read in place below is done.)
         if through_copy() || !crate::watch::soft_runs(start, size).is_empty() {
             return with_title(self.memory, size, |tiled| {
-                let hash = digest(tiled);
+                let hash = self.digest(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
@@ -1619,7 +1636,7 @@ impl Staging {
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = digest(tiled);
+        let hash = self.digest(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
@@ -1646,7 +1663,7 @@ impl Staging {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            let hash = digest(read);
+            let hash = self.digest(read);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
                 self.detile(read);
@@ -1679,7 +1696,7 @@ impl Staging {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            let hash = digest(read);
+            let hash = self.digest(read);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
                 self.detile(read);
@@ -1714,7 +1731,7 @@ impl Staging {
                 crate::watch::change_over();
             }
             if got != 0 {
-                last.hash = Some(digest(read));
+                last.hash = Some(self.digest(read));
                 self.detile(read);
             }
             got

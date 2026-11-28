@@ -1153,6 +1153,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     // the title wrote them (`crate::port`), with nothing refreshed, filled
     // or waited for. The list holds the buffer.
     if !srv && let Some((buffer, gpu)) = crate::port::constants(address, 1 << 16, crate::port::Use::Root) {
+        crate::rf_x3::constant(list, address, 1 << 16);
         list.keep(&buffer);
         return Some(gpu);
     }
@@ -1162,11 +1163,14 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         .min(if srv { limit } else { 1 << 16 });
     let gpu = shadow.gpu(address);
     if srv || gpu % crate::port::ALIGN == 0 {
+        let access = if srv { crate::rf_x3::Access::Srv } else { crate::rf_x3::Access::Cbv };
+        list.rf_x3_shadow(&shadow, access, address, len, false);
         shadow.refresh(list, address, len);
         #[cfg(feature = "diagnostics")]
         crate::book::root(gpu, len);
         return Some(gpu);
     }
+    crate::rf_x3::constant(list, address, len);
     list.fill_scratch(address as *const u8, len)
 }
 
@@ -1836,6 +1840,7 @@ impl State {
                 continue;
             }
             if let Some((buffer, gpu)) = crate::port::stream_bytes(v.address, u64::from(v.size)) {
+                crate::rf_x3::stream(list, crate::rf_x3::Access::Vertex, v.address, u64::from(v.size));
                 list.keep(&buffer);
                 *view = D3D12_VERTEX_BUFFER_VIEW {
                     BufferLocation: gpu,
@@ -1847,6 +1852,7 @@ impl State {
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
                 continue;
             };
+            list.rf_x3_shadow(&shadow, crate::rf_x3::Access::Vertex, v.address, u64::from(v.size), false);
             shadow.refresh(list, v.address, u64::from(v.size));
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
@@ -1863,12 +1869,14 @@ impl State {
         if indexed {
             let v = self.index;
             let (gpu, size) = if let Some((buffer, gpu)) = crate::port::stream_bytes(v.address, u64::from(v.size)) {
+                crate::rf_x3::stream(list, crate::rf_x3::Access::Index, v.address, u64::from(v.size));
                 list.keep(&buffer);
                 (gpu, v.size)
             } else {
                 let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
                     return false;
                 };
+                list.rf_x3_shadow(&shadow, crate::rf_x3::Access::Index, v.address, u64::from(v.size), false);
                 shadow.refresh(list, v.address, u64::from(v.size));
                 (
                     shadow.gpu(v.address),
@@ -2305,6 +2313,7 @@ impl State {
         let pipeline = self.pipeline;
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
             let len = s.left(a).min(limit);
+            list.rf_x3_shadow(s, crate::rf_x3::Access::Uav, a, len, writes);
             s.refresh(list, a, len);
             if writes {
                 #[cfg(feature = "diagnostics")]
@@ -2454,6 +2463,7 @@ impl State {
         // buffer is brought up to date. The first 1 MiB only left what lay
         // past it stale (most mesh vertex streams reach further).
         if let Some((a, s)) = &shadow {
+            list.rf_x3_shadow(s, crate::rf_x3::Access::Srv, *a, s.left(*a), false);
             s.refresh(list, *a, s.left(*a));
         }
         let handle = host.gpu_handle(index);
@@ -4728,9 +4738,11 @@ impl State {
                     if *depth {
                         TESTED_DEPTH.set((reader.3, true));
                     }
+                    crate::rf_x3::cached_table(list, table, entries, false);
                     made.push((slot, first * 32));
                     continue;
                 }
+                crate::rf_x3::cached_table(list, table, entries, true);
                 let depth_before = TESTED_DEPTH.get();
                 TESTED_DEPTH.set((depth_before.0, false));
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
@@ -4808,6 +4820,7 @@ impl State {
                             if let Some(kind) = kind {
                                 let tested = TESTED_DEPTH.get();
                                 if kind == ResourceType::Srv && listed.ready.0 == list.epoch() && listed.ready.1 == tested.0 {
+                                    crate::rf_x3::listed_srv(list, target);
                                     if listed.ready.2 {
                                         TESTED_DEPTH.set((tested.0, true));
                                     }
@@ -4846,6 +4859,7 @@ impl State {
                 let used = group.entry(k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        crate::rf_x3::table_constant(list, address, size, used.is_some(), &selected, k);
                         // In the title's graphics heap and written by no
                         // shader: the slot shows the title's bytes
                         // themselves (`crate::port`); the slot and the list
@@ -5383,6 +5397,10 @@ impl State {
             return false;
         }
         // One record without a count: clamped in a batch (`batches`).
+        list.rf_x3_shadow(&args, crate::rf_x3::Access::Indirect, arguments, len, false);
+        if let Some((shadow, address)) = &counter {
+            list.rf_x3_shadow(shadow, crate::rf_x3::Access::Indirect, *address, 4, false);
+        }
         let batch = if batches() > 0 && max == 1 && count.is_none() {
             args.refresh(list, arguments, len);
             self.batched(list, &args, arguments, kind)
@@ -5824,7 +5842,9 @@ fn refresh_buffer_view(
     if kind == ResourceType::Uav {
         // A shader that cannot store to buffers leaves the range as
         // the title has it: nothing to find afterwards.
-        if STORES.get() || !write_skip() {
+        let writes = STORES.get() || !write_skip();
+        list.rf_x3_shadow(shadow, crate::rf_x3::Access::Uav, address, len, writes);
+        if writes {
             #[cfg(feature = "diagnostics")]
             crate::host::wide_write(address, len, 0);
             shadow.gpu_writes(list, address, len);
@@ -5835,10 +5855,13 @@ fn refresh_buffer_view(
                 crate::copystat::add(crate::copystat::C::GpuWritesLeftOutBytes, len);
             }
         }
+    } else if kind == ResourceType::Srv {
+        list.rf_x3_shadow(shadow, crate::rf_x3::Access::Srv, address, len, false);
     }
 }
 
 fn readable_shader_texture(list: &HostList, resource: usize, first: u32, uploadable: Option<bool>) {
+    crate::rf_x3::texture_use(list, resource, crate::rf_x3::Access::Srv, false);
     // A view the title placed, in another format, in the memory of
     // a texture the host writes: that texture's texels, copied on
     // the host (title memory does not have them).
@@ -5881,6 +5904,7 @@ fn readable_shader_texture(list: &HostList, resource: usize, first: u32, uploada
 }
 
 fn readable_unordered_texture(list: &HostList, resource: usize) {
+    crate::rf_x3::texture_use(list, resource, crate::rf_x3::Access::Uav, true);
     const UNORDERED_ACCESS: u32 = 0x8;
     #[cfg(feature = "diagnostics")]
     crate::capture::note_target(resource as This);

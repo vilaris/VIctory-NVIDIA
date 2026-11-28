@@ -3062,8 +3062,8 @@ enum Step {
     /// buffer copies, which later refreshes must see.
     Copy(usize, usize, usize),
     /// A copy of title memory into the list's own upload memory, and how
-    /// the card could bring the bytes instead.
-    Fill(usize, usize, usize, Option<card_steps::FillTo>),
+    /// the card could bring the bytes instead. The last field identifies constants.
+    Fill(usize, usize, usize, Option<card_steps::FillTo>, bool), // rf-x3
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
     /// intervenes.
@@ -3090,6 +3090,7 @@ enum Step {
 /// the upload buffers its GPU commands read, kept until the list is reset.
 #[derive(Default)]
 struct Deferred {
+    rf_x3: crate::rf_x3::Bindings, // rf-x3
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
@@ -3167,6 +3168,7 @@ impl Deferred {
 
     /// Empties all lists and sets in place, keeping their backing capacity.
     fn clear(&mut self) {
+        self.rf_x3.clear(); // rf-x3
         give_chunks(std::mem::take(&mut self.plane_uploads));
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
@@ -3871,7 +3873,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 }
-                &Step::Fill(_, src, len, _) => {
+                &Step::Fill(_, src, len, ..) => {
                     if read_blocked(written, src, len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
@@ -5399,7 +5401,9 @@ impl Host {
         let taking = crate::timeline::span("copies in the card's memory: taken");
         let own = if send::own() { send::take(self, &dirty) } else { None };
         taking.end();
-        let mark = card_time(1, mark);
+        let taken = card_time(1, mark);
+        crate::rf_x3::card_before(&dirty, own.as_ref().map(|_| taken.duration_since(mark))); // rf-x3
+        let mark = taken;
         // Dwords of `differs` the hash passes' tables take (`card_table`), ahead of the
         // compare's results: given back with them.
         let mut hash_slot = work.taken;
@@ -7142,6 +7146,7 @@ impl Host {
         // What shaders may write through views they pick: last, so that no
         // refresh of this submission leaves it alone.
         let picked = crate::picked::declare(runs);
+        crate::rf_x3::picked_writes(&picked.written); // rf-x3
         for (shadow, at, len) in &picked.written {
             shadow.writing(*at, *len);
         }
@@ -8666,7 +8671,7 @@ impl HostList {
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
         self.deferred()
             .copies
-            .push(Step::Fill(dst as usize, src as usize, len, None));
+            .push(Step::Fill(dst as usize, src as usize, len, None, true)); // rf-x3
     }
 
     /// The host address of `len` bytes of scratch memory that hold the title
@@ -8697,14 +8702,42 @@ impl HostList {
         }
         self.deferred()
             .copies
-            .push(Step::Fill(dst as usize, src as usize, len, Some(card_steps::FillTo::Slot(slot.0, slot.1))));
+            .push(Step::Fill(dst as usize, src as usize, len, Some(card_steps::FillTo::Slot(slot.0, slot.1)), true)); // rf-x3
     }
 
     /// As [`HostList::defer_fill`], for the beginning of a buffer
     /// [`HostList::upload`] made.
     pub(crate) fn defer_fill_buffer(&self, buffer: &ID3D12Resource, dst: *mut u8, src: *const u8, len: usize) {
         let to = (card_steps::stage() > 1).then(|| card_steps::FillTo::Buffer(buffer.clone()));
-        self.deferred().copies.push(Step::Fill(dst as usize, src as usize, len, to));
+        self.deferred().copies.push(Step::Fill(dst as usize, src as usize, len, to, false)); // rf-x3
+    }
+
+    // rf-x3
+    pub(crate) fn rf_x3_shadow(
+        &self,
+        shadow: &crate::shadow::Shadow,
+        access: crate::rf_x3::Access,
+        address: u64,
+        len: u64,
+        writes: bool,
+    ) {
+        if crate::rf_x3::enabled() {
+            self.deferred().rf_x3.note(crate::rf_x3::Object::shadow(shadow), access, len.min(shadow.left(address)), writes, shadow.carded());
+        }
+    }
+
+    // rf-x3
+    pub(crate) fn rf_x3_use(&self, object: crate::rf_x3::Object, access: crate::rf_x3::Access, len: u64, writes: bool) {
+        if crate::rf_x3::enabled() {
+            self.deferred().rf_x3.note(object, access, len, writes, false);
+        }
+    }
+
+    // rf-x3
+    pub(crate) fn rf_x3_write(&self, shadow: &crate::shadow::Shadow, len: u64) {
+        if crate::rf_x3::enabled() && len != 0 {
+            self.deferred().rf_x3.mark_write(crate::rf_x3::Object::shadow(shadow), shadow.carded());
+        }
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -9196,7 +9229,9 @@ impl HostList {
         let (mut us, mut bytes) = (std::time::Duration::ZERO, 0u64);
         #[cfg(feature = "diagnostics")]
         let (mut copies, mut refreshes, mut refreshed) = (0u64, 0u64, 0u64);
-        for (i, step) in self.deferred().copies.iter().enumerate() {
+        let deferred = self.deferred();
+        deferred.rf_x3.submit(); // rf-x3
+        for (i, step) in deferred.copies.iter().enumerate() {
             if matches!(step, Step::Copy(..) | Step::Fill(..)) && taken(i) {
                 continue;
             }
@@ -9225,14 +9260,14 @@ impl HostList {
                     }
                     (started, len)
                 }
-                &Step::Fill(dst, src, len, _) => {
+                &Step::Fill(dst, src, len, _, constants) => {
                     #[cfg(feature = "diagnostics")]
                     {
                         copies += 1;
                     }
                     crate::port::filled(src, len);
                     if wide_fills() {
-                        batch.fills.push((dst, src, len));
+                        batch.fills.push((dst, src, len, constants)); // rf-x3
                         bytes += len as u64;
                         continue;
                     }
@@ -9315,17 +9350,31 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::Plane((_, len), fill) => {
+                Step::Plane((src, len), fill) => {
                     let started = std::time::Instant::now();
                     fill();
-                    PREPARING[2].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    let us = started.elapsed().as_micros() as u64;
+                    PREPARING[2].fetch_add(us, Ordering::Relaxed);
                     PREPARING[3].fetch_add(*len as u64, Ordering::Relaxed);
+                    crate::rf_x3::plane(*src, *len, us); // rf-x3
                     continue;
                 }
             };
-            us += started.elapsed();
+            let took = started.elapsed();
+            us += took;
             bytes += copied as u64;
+            if crate::rf_x3::enabled() {
+                use crate::rf_x3::{Object, Source, fill_object, work}; // rf-x3
+                let (object, source) = match *step {
+                    Step::Copy(dst, ..) => (Object::title_copy(dst, copied), Source::TitleCopy),
+                    Step::Fill(_, src, len, _, constants) => (fill_object(src, len, constants), Source::Fill),
+                    Step::Placed(ref p) => (Object::shadow(&p.shadow), Source::Placed),
+                    _ => unreachable!("steps without copy accounting continue above"),
+                };
+                work(object, source, copied as u64, took.as_micros() as u64);
+            }
         }
+        drop(deferred); // rf-x3
         PREPARING[0].fetch_add(us.as_micros() as u64, Ordering::Relaxed);
         PREPARING[1].fetch_add(bytes, Ordering::Relaxed);
         SPLIT[7].fetch_add(us.as_nanos() as u64, Ordering::Relaxed);
@@ -9483,12 +9532,15 @@ impl Split {
 /// line, in every build: what its submissions spent where (the parts add up
 /// to the first number; refreshes and copies are inside the lists' steps),
 /// and its time after each sending.
-fn submit_split_line(frames: f64) {
-    let ms: [f64; 16] = std::array::from_fn(|i| SPLIT[i].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames);
-    let f: [f64; 4] = std::array::from_fn(|i| FLUSHES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+fn submit_split_line(frames: f64, sample: impl FnOnce([u64; 16], [u64; 4])) {
+    let split = SPLIT.each_ref().map(|c| c.swap(0, Ordering::Relaxed)); // rf-x3
+    let flushes = FLUSHES.each_ref().map(|c| c.swap(0, Ordering::Relaxed)); // rf-x3
+    let ms = split.map(|n| n as f64 / 1e6 / frames);
+    let f = flushes.map(|n| n as f64 / frames);
     let after = AFTER_SEND.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
     let parts: [f64; 4] = std::array::from_fn(|i| AFTER_PARTS[i].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames);
     let inline = LANDED_INLINE.swap(0, Ordering::Relaxed) as f64 / frames;
+    sample(split, flushes); // rf-x3
     let all: f64 = [0, 1, 2, 3, 4, 5, 11, 12, 13, 14, 15].iter().map(|&i| ms[i]).sum();
     if all + after <= 0.0 {
         return;
@@ -9675,7 +9727,7 @@ struct Batch {
     /// memory ([`place`]): the host copy, the title address, the bytes.
     placed: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, Vec<u8>)>,
     /// Fills not done yet (destination, source, bytes): [`wide_fills`].
-    fills: Vec<(usize, usize, usize)>,
+    fills: Vec<(usize, usize, usize, bool)>, // rf-x3
     /// Copies (by address) brought up to date ahead of the steps, and the
     /// range (from, to) ([`Batch::refresh_ahead`]).
     ahead: ByCopy<(usize, usize)>,
@@ -10020,9 +10072,12 @@ impl Batch {
     }
 
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        use crate::rf_x3::{Check, checked, timer}; // rf-x3
+        let started = timer();
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
         if self.ahead.get(&key).is_some_and(|&(from, to)| from <= address && end <= to) {
+            checked(started, Check::AheadSpan); // rf-x3
             return;
         }
         if crate::watch::light() {
@@ -10033,14 +10088,17 @@ impl Batch {
                 return;
             }
         }
+        let started = timer(); // rf-x3
         match self.index.get(&key) {
             Some(&at) => {
                 let r = &mut self.refreshes[at];
                 (r.1, r.2) = (r.1.min(address), r.2.max(end));
+                checked(started, Check::MergeSpan); // rf-x3
             }
             None => {
                 self.index.insert(key, self.refreshes.len());
                 self.refreshes.push((shadow.clone(), address, end));
+                checked(started, Check::QueueSpan); // rf-x3
             }
         }
     }
@@ -10067,12 +10125,14 @@ impl Batch {
         }
         let ns = started.elapsed().as_nanos() as u64;
         SPLIT[6].fetch_add(ns, Ordering::Relaxed);
+        crate::rf_x3::refresh_wall(crate::rf_x3::Check::OneWall, ns); // rf-x3
         SPLIT[9].fetch_add(ns, Ordering::Relaxed);
         SPLIT[10].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Brings `[from, to)` of a copy up to date, timed.
     fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
+        let verify = crate::rf_x3::verify_candidate(shadow, from, to); // rf-x3
         let started = std::time::Instant::now();
         let _one = crate::timeline::span("a copy's refresh");
         let copied = shadow.update(from, to - from);
@@ -10081,6 +10141,8 @@ impl Batch {
         crate::copystat::range(from, to - from, us, 0);
         PREPARING[0].fetch_add(us, Ordering::Relaxed);
         PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        crate::rf_x3::refresh(shadow, copied, us); // rf-x3
+        crate::rf_x3::verify_update(shadow, from, to - from, copied, verify); // rf-x3
     }
 
     /// Whether `staging` is still to be refreshed in this submission (and
@@ -10130,7 +10192,13 @@ impl Batch {
         let many = spans.len() > FEW;
         if !many {
             let all = spans.len();
-            spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            spans.retain(|(shadow, from, to)| {
+                if light && worker_kept.is_none() {
+                    !crate::rf_x3::after_memo_miss(shadow, *from, *to - *from) // rf-x3
+                } else {
+                    !shadow.nothing_new(*from, *to - *from)
+                }
+            });
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
         let ahead = spans.len() > 1 && !crate::watch::kept();
@@ -10157,7 +10225,14 @@ impl Batch {
                 let known = worker_kept.as_ref().is_some_and(|kept| {
                     shadow.fast_nothing_new_known(*from, len, |a, b| kept.covers_current(a, b))
                 });
-                if known || (many && shadow.nothing_new(*from, len)) {
+                let clean_now = || {
+                    if light {
+                        crate::rf_x3::after_memo_miss(shadow, *from, len) // rf-x3
+                    } else {
+                        shadow.nothing_new(*from, len)
+                    }
+                };
+                if known || (many && clean_now()) {
                     clean += 1;
                 } else {
                     Self::update(shadow, *from, *to);
@@ -10177,7 +10252,9 @@ impl Batch {
         PREPARING[2].fetch_sub(textures, Ordering::Relaxed);
         PREPARING[0].fetch_sub(copies, Ordering::Relaxed);
         PREPARING[0].fetch_add(took, Ordering::Relaxed);
-        SPLIT[6].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let ns = started.elapsed().as_nanos() as u64;
+        SPLIT[6].fetch_add(ns, Ordering::Relaxed);
+        crate::rf_x3::refresh_wall(crate::rf_x3::Check::FrontWall, ns); // rf-x3
     }
 
     /// Before the steps of `runs` ([`ahead_of_writes`]); copies and fills
@@ -10220,6 +10297,7 @@ impl Batch {
         PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
         let ns = started.elapsed().as_nanos() as u64;
         SPLIT[6].fetch_add(ns, Ordering::Relaxed);
+        crate::rf_x3::refresh_wall(crate::rf_x3::Check::BeforeWritesWall, ns); // rf-x3
         SPLIT[9].fetch_add(ns, Ordering::Relaxed);
     }
 
@@ -10231,20 +10309,22 @@ impl Batch {
         if self.fills.is_empty() {
             return;
         }
+        let observed = crate::rf_x3::observe_fills(&self.fills); // rf-x3
         let started = std::time::Instant::now();
         if self.fills.len() < FEW {
-            for (dst, src, len) in self.fills.drain(..) {
+            for (dst, src, len, _) in self.fills.drain(..) {
                 copy_mapped(dst as *mut u8, src as *const u8, len, false);
             }
         } else {
             let fills = std::mem::take(&mut self.fills);
             crate::shadow::wide_each(fills.len().div_ceil(PART), move |i| {
-                for &(dst, src, len) in fills.iter().skip(i * PART).take(PART) {
+                for &(dst, src, len, _) in fills.iter().skip(i * PART).take(PART) {
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                 }
             });
         }
         let took = started.elapsed();
+        crate::rf_x3::fills(observed, took); // rf-x3
         PREPARING[0].fetch_add(took.as_micros() as u64, Ordering::Relaxed);
         SPLIT[7].fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
     }
@@ -10274,7 +10354,9 @@ impl Batch {
         let (began, all) = (std::time::Instant::now(), self.refreshes.len());
         let _flush = crate::timeline::span("refreshes of copies");
         self.flush_all();
-        SPLIT[6].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let ns = began.elapsed().as_nanos() as u64;
+        SPLIT[6].fetch_add(ns, Ordering::Relaxed);
+        crate::rf_x3::refresh_wall(crate::rf_x3::Check::FlushWall, ns); // rf-x3
         FLUSHES[0].fetch_add(1, Ordering::Relaxed);
         FLUSHES[1].fetch_add(all as u64, Ordering::Relaxed);
     }
@@ -10294,7 +10376,7 @@ impl Batch {
                 !shadow.fast_nothing_new_known(*from, *to - *from, |a, b| crate::watch::kept_covers_cached(kept, a, b))
             });
             if self.refreshes.len() <= FEW {
-                self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+                self.refreshes.retain(|(shadow, from, to)| !crate::rf_x3::after_memo_miss(shadow, *from, *to - *from)); // rf-x3
             }
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
@@ -10332,7 +10414,7 @@ impl Batch {
                 crate::shadow::wide_each(refreshes.len().div_ceil(group), move |i| {
                     let mut clean = 0;
                     for (shadow, from, to) in &refreshes[i * group..((i + 1) * group).min(refreshes.len())] {
-                        if many && shadow.nothing_new(*from, *to - *from) {
+                        if many && crate::rf_x3::after_memo_miss(shadow, *from, *to - *from) { // rf-x3
                             clean += 1;
                             continue;
                         }
@@ -10895,6 +10977,7 @@ struct Presenter {
 pub(crate) static METER_FPS_TENTHS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 struct Meter {
+    rf_x3: crate::rf_x3::Meter, // rf-x3
     since: std::time::Instant,
     previous_sample: Option<(std::time::Instant, u64)>,
     frames: u32,
@@ -10913,6 +10996,7 @@ impl Meter {
         let now = std::time::Instant::now();
         let drawn = crate::draw::drawn();
         Meter {
+            rf_x3: Default::default(), // rf-x3
             since: now,
             previous_sample: crate::switch::on("VICTORY_FRAMETIME_SAMPLES").then_some((now, drawn)),
             frames: 0,
@@ -10952,6 +11036,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
         self.frames += 1;
+        self.rf_x3.present(); // rf-x3
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
@@ -10972,12 +11057,11 @@ impl Meter {
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
-        let [cpu, gpu] = [0, 1].map(|i| {
-            SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
-        });
-        let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
-            let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
-            PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
+        let [prepare_us, gpu_us] = SUBMISSION_US.each_ref().map(|c| c.swap(0, Ordering::Relaxed)); // rf-x3
+        let [cpu, gpu] = [prepare_us, gpu_us].map(|us| us as f64 / 1000.0 / frames);
+        let preparing = PREPARING.each_ref().map(|c| c.swap(0, Ordering::Relaxed)); // rf-x3
+        let [copy_ms, copy_mb, texture_ms, texture_mb] = std::array::from_fn(|i| {
+            preparing[i] as f64 / (if i % 2 == 0 { 1e3 } else { 1e6 }) / frames
         });
         let [back_ms, back_mb] = [0, 1].map(|i| {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
@@ -11004,7 +11088,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         spans::line(frames);
         crate::shadow::back_line(frames);
-        submit_split_line(frames);
+        submit_split_line(frames, |split, flushes| self.rf_x3.sample(elapsed, frames as u64, preparing, prepare_us, split, flushes)); // rf-x3
         fresh_open_line(frames);
         crate::heap_marks::line(frames);
         #[cfg(feature = "diagnostics")]

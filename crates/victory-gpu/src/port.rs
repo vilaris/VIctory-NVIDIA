@@ -378,6 +378,14 @@ fn region_holding(at: u64, end: u64) -> Option<(ID3D12Resource, u64)> {
     }
 }
 
+/// Whether the existing port already opened this range through its own view.
+/// This only observes regions. It never tries to open a heap.
+pub(crate) fn range_open(at: u64, end: u64) -> bool {
+    let hi = BOUNDS[1].load(Ordering::Relaxed);
+    hi != 0 && at >= BOUNDS[0].load(Ordering::Relaxed) && end <= hi
+        && REGIONS.read().unwrap_or_else(|e| e.into_inner()).iter().any(|r| r.start <= at && end <= r.end)
+}
+
 /// The region holding the pages of `[at, end)`, opened if none does: its
 /// whole buffer and start. `Err` with the statistic to count and why.
 fn region_for(device: &ID3D12Device, at: u64, end: u64) -> Result<(ID3D12Resource, u64), (usize, String)> {

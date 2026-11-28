@@ -91,6 +91,8 @@ pub mod replay;
 mod residency;
 #[cfg(windows)]
 mod rf_x2; // rf-x2
+#[cfg(any(windows, test))]
+mod rf_x3;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
