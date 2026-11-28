@@ -213,6 +213,7 @@ mod telemetry {
         UploadPack,
         Texture,
         Fill,
+        Planning,
     }
 
     #[derive(Clone, Copy)]
@@ -228,8 +229,8 @@ mod telemetry {
         UploadRing,
     }
 
-    static WORK: [[AtomicU64; 2]; 8] =
-        [const { [const { AtomicU64::new(0) }; 2] }; 8];
+    static WORK: [[AtomicU64; 2]; 9] =
+        [const { [const { AtomicU64::new(0) }; 2] }; 9];
     static TRAFFIC: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
     static BITMAP: AtomicU64 = AtomicU64::new(0);
     static GAPS: AtomicU64 = AtomicU64::new(0);
@@ -285,7 +286,7 @@ mod telemetry {
             return;
         }
         let per_frame = |counter: &AtomicU64| counter.swap(0, Ordering::Relaxed) as f64 / frames;
-        let [refresh, descriptor, capture, fault, record_heap_wait, pack, texture, fill] =
+        let [refresh, descriptor, capture, fault, record_heap_wait, pack, texture, fill, plan] =
             WORK.each_ref().map(|row| [per_frame(&row[0]), per_frame(&row[1]) / 1e6]);
         let [scratch, upload, readback, descriptors, kernel, guard, untracked, texture_read, ring] =
             TRAFFIC.each_ref().map(|value| per_frame(value) / (1 << 20) as f64);
@@ -300,8 +301,8 @@ mod telemetry {
             per_frame(&WATCH_CHANGED), per_frame(&CPU_READ),
         );
         tracing::info!(
-            "rf-x9: jobs[count/ms per frame upload-pack={:.1}/{:.3} texture={:.1}/{:.3} fill={:.1}/{:.3}] MiB/frame[texture-read={texture_read:.2} upload-ring={ring:.2}]",
-            pack[0], pack[1], texture[0], texture[1], fill[0], fill[1],
+            "rf-x9: jobs[count/ms per frame upload-pack={:.1}/{:.3} texture={:.1}/{:.3} fill={:.1}/{:.3} planning={:.1}/{:.3}] MiB/frame[texture-read={texture_read:.2} upload-ring={ring:.2}]",
+            pack[0], pack[1], texture[0], texture[1], fill[0], fill[1], plan[0], plan[1],
         );
     }
 }

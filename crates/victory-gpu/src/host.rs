@@ -1427,7 +1427,7 @@ pub(crate) struct HostList {
     pub(crate) list: ID3D12GraphicsCommandList,
     pub(crate) rf_x2: Option<Box<crate::rf_x2::Recording>>, // rf-x2
     /// Work for submission time, in recorded order.
-    deferred: Mutex<Deferred>,
+    deferred: x9_plan::Recording,
     /// Upload memory for data the list's draws make (expanded vertices),
     /// reused after a reset.
     scratch: Mutex<Scratch>,
@@ -3093,6 +3093,7 @@ struct Deferred {
     rf_x3: crate::rf_x3::Bindings, // rf-x3
     /// Destination, source, bytes.
     copies: Vec<Step>,
+    x9_plan: Option<std::sync::Arc<OnceLock<x9_plan::Plan>>>,
     uploads: Vec<ID3D12Resource>,
     /// Standalone upload footprints kept through this list's fence (movie planes).
     plane_uploads: Vec<(Chunk, u64)>,
@@ -3173,6 +3174,7 @@ impl Deferred {
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
         self.copies.clear();
+        self.x9_plan = None;
         self.uploads.clear();
         self.prelude_uploads.clear();
         self.upload_bytes = 0;
@@ -4768,6 +4770,7 @@ mod stamps;
 mod water_timing;
 mod gpu_time;
 pub(crate) mod render_trace;
+mod x9_plan;
 pub(crate) use gpu_time::{Step as GpuStep, count_barriers as count_gpu_barriers, count_step as count_gpu_step};
 #[cfg(feature = "diagnostics")]
 pub(crate) use stamps::{timeline_ready, timeline_restart, timeline_stamps};
@@ -4880,7 +4883,7 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
     let mut places: ByCopy<usize> = ByCopy::default();
     let mut seen = std::collections::HashSet::<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>::default();
     for list in runs {
-        for step in &list.deferred().copies {
+        for step in list.deferred().x9_steps(true) {
             if let Step::GpuWrite(shadow, address, len) = step {
                 let key = std::sync::Arc::as_ptr(shadow) as usize;
                 if !seen.insert((key, *address, *len)) {
@@ -5191,7 +5194,7 @@ impl Host {
                 allocator: Mutex::new((allocator, now_ms())),
                 list,
                 rf_x2, // rf-x2
-                deferred: Mutex::default(),
+                deferred: x9_plan::Recording::new(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
@@ -8680,6 +8683,12 @@ impl HostList {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The queue calls this after the list is detached. The worker can plan
+    /// its immutable steps before the queue's earlier submission is ready.
+    pub(crate) fn plan_x9_capture(&self) {
+        self.deferred.plan();
+    }
+
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         // `card_steps` may do it on the card, landing after the flight:
@@ -10129,7 +10138,7 @@ impl Batch {
             if front.is_some_and(|parts| parts.contains(&n)) {
                 part += 1;
             }
-            for step in &list.deferred().copies {
+            for step in list.deferred().x9_steps(false) {
                 let (shadow, address, len) = match step {
                     Step::Refresh(shadow, address, len) => (shadow, address, len),
                     Step::GpuWrite(shadow, ..) if front.is_some() => {
