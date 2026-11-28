@@ -188,18 +188,12 @@ pub(super) fn reads(step: &Step, ranges: &[(usize, usize)]) -> bool {
     }
 }
 
-enum CopyWait {
-    Before,
-    Between,
-    After,
-}
-
-/// Orders the accesses on both sides of a placed copy.
+/// Orders placed copies against surrounding legacy transitions and accesses.
 ///
 /// # Safety
 /// An open list.
 #[track_caller]
-unsafe fn wait_for_copy(host: &Host, list: &ID3D12GraphicsCommandList, point: CopyWait) {
+unsafe fn wait_for_all(host: &Host, list: &ID3D12GraphicsCommandList) {
     static ENHANCED: OnceLock<bool> = OnceLock::new();
     let enhanced = *ENHANCED.get_or_init(|| {
         let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
@@ -216,29 +210,14 @@ unsafe fn wait_for_copy(host: &Host, list: &ID3D12GraphicsCommandList, point: Co
     // SAFETY: the caller's.
     unsafe {
         if enhanced && let Ok(enhanced) = list.cast::<ID3D12GraphicsCommandList7>() {
-            let mut barrier = D3D12_GLOBAL_BARRIER {
+            // The shadow's previous barrier may have left any legacy sync
+            // scope, and a later barrier may consume either buffer or alias.
+            let all = [D3D12_GLOBAL_BARRIER {
                 SyncBefore: D3D12_BARRIER_SYNC_ALL,
                 SyncAfter: D3D12_BARRIER_SYNC_ALL,
                 AccessBefore: D3D12_BARRIER_ACCESS_COMMON,
                 AccessAfter: D3D12_BARRIER_ACCESS_COMMON,
-            };
-            if crate::rf_x7::narrow() {
-                let copy = D3D12_BARRIER_ACCESS_COPY_SOURCE | D3D12_BARRIER_ACCESS_COPY_DEST;
-                if matches!(point, CopyWait::Between | CopyWait::After) {
-                    // The completed copy must finish both its reads and writes
-                    // before subsequent users, including a writer of its source.
-                    barrier.SyncBefore = D3D12_BARRIER_SYNC_COPY;
-                    barrier.AccessBefore = copy;
-                }
-                if matches!(point, CopyWait::Before | CopyWait::Between) {
-                    // Earlier accesses can come from any pipeline, but the
-                    // operation this wait protects is a buffer copy.
-                    barrier.SyncAfter = D3D12_BARRIER_SYNC_COPY;
-                    barrier.AccessAfter = copy;
-                }
-                crate::rf_x7::mark_scoped_global();
-            }
-            let all = [barrier];
+            }];
             crate::rf_x2::global_barrier(list, &enhanced, &[D3D12_BARRIER_GROUP { // rf-x2
                 Type: D3D12_BARRIER_TYPE_GLOBAL,
                 NumBarriers: 1,
@@ -306,7 +285,7 @@ impl HostList {
         // SAFETY (both): an open list; live buffers (the list holds the
         // copies and its scratch memory), ranges inside them.
         self.rf_x7_other_work();
-        unsafe { wait_for_copy(host, &self.list, CopyWait::Before) };
+        unsafe { wait_for_all(host, &self.list) };
         match (&own, &scratch) {
             (Some(from), _) => {
                 from.refresh(self, src as u64, len as u64);
@@ -319,7 +298,7 @@ impl HostList {
                         crate::rf_x7::work(&self.list, None);
                         self.list.CopyBufferRegion(&between, 0, &from.buffer, offset, len as u64);
                         crate::rf_x2::barriers(&self.list, "vx:barrier.place", &[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]); // rf-x2
-                        wait_for_copy(host, &self.list, CopyWait::Between);
+                        wait_for_all(host, &self.list);
                         crate::rf_x7::work(&self.list, None);
                         self.list.CopyBufferRegion(&to.buffer, at, &between, 0, len as u64);
                     }
@@ -335,7 +314,7 @@ impl HostList {
             },
             (None, None) => return false,
         }
-        unsafe { wait_for_copy(host, &self.list, CopyWait::After) };
+        unsafe { wait_for_all(host, &self.list) };
         STATS[0].fetch_add(1, Ordering::Relaxed);
         STATS[1].fetch_add(len as u64, Ordering::Relaxed);
         to.gpu_writes(self, dst as u64, len as u64);
@@ -369,11 +348,11 @@ impl HostList {
         // SAFETY: an open list; live buffers, ranges inside them.
         unsafe {
             self.rf_x7_other_work();
-            wait_for_copy(host, &self.list, CopyWait::Before);
+            wait_for_all(host, &self.list);
             crate::rf_x7::work(&self.list, None);
             self.list.CopyBufferRegion(&between, 0, &from.buffer, from.offset(src as u64), len as u64);
             crate::rf_x2::barriers(&self.list, "vx:barrier.place", &[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]); // rf-x2
-            wait_for_copy(host, &self.list, CopyWait::After);
+            wait_for_all(host, &self.list);
         }
         Some(between)
     }
@@ -421,7 +400,7 @@ impl HostList {
         unsafe {
             let _rf_x2 = crate::rf_x2::range(&self.list, "vx:coh.place"); // rf-x2
             self.rf_x7_other_work();
-            wait_for_copy(host, &self.list, CopyWait::Before);
+            wait_for_all(host, &self.list);
             if !fresh {
                 crate::rf_x2::barriers(&self.list, "vx:barrier.place", &[transition(&buffer, read, D3D12_RESOURCE_STATE_COPY_DEST)]); // rf-x2
             }

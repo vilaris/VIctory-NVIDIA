@@ -253,11 +253,11 @@ fn discard_thin_state(this: This) {
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     let list = host_list_ordered(this)?;
-    list.rf_x7_flush();
+    list.rf_x7_other_work();
     Some(list)
 }
 
-/// A barrier or a call that can consume a pending barrier itself.
+/// A call whose GPU work is tracked at its recording site, or a state change.
 #[cfg(windows)]
 fn host_list_ordered<'a>(this: This) -> Option<&'a crate::host::HostList> {
     let list = host_list_held(this)?;
@@ -1088,7 +1088,7 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
         crate::host::count_gpu_step(crate::host::GpuStep::OurStates, 0);
         // SAFETY: an open list and a live texture.
-        crate::rf_x7::adjacent_title(list, "vx:barrier.tex.state", &[barrier]);
+        unsafe { crate::rf_x2::barriers(&list.list, "vx:barrier.tex.state", &[barrier]) };
     }
 }
 
@@ -1620,13 +1620,11 @@ extern "system" fn clear_rtv(
 ) {
     #[cfg(windows)]
     {
-        let (Some(list), Some(record)) = (host_list_ordered(this), crate::descriptor::rtv_record(handle))
+        let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
         else {
             return;
         };
-        if !crate::rf_x7::narrow() {
-            list.gpu_step(crate::host::GpuStep::Clears, 0);
-        }
+        list.gpu_step(crate::host::GpuStep::Clears, 0);
         let (Some(texture), Some(host)) = (
             crate::resource::host_resource(record.resource),
             crate::host::host(),
@@ -1647,14 +1645,12 @@ extern "system" fn clear_rtv(
         unsafe {
             if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
                 use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-                crate::rf_x7::adjacent_title(list, "vx:barrier.targets", &[crate::host::transition(
+                let after = crate::host::legal_state(texture, RENDER_TARGET);
+                crate::rf_x2::barriers(&list.list, "vx:barrier.targets", &[crate::host::transition(
                     texture,
                     State(before as i32),
-                    State(RENDER_TARGET as i32),
+                    State(after as i32),
                 )]);
-            }
-            if crate::rf_x7::narrow() {
-                list.gpu_step(crate::host::GpuStep::Clears, 0);
             }
             list.list.ClearRenderTargetView(rtv, color, rects);
         }
@@ -1749,7 +1745,7 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
 extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     count_dispatch();
     #[cfg(windows)]
-    with_state(this, |list, s| s.dispatch(list, x, y, z, flags));
+    with_state_on(host_list_ordered(this), this, |list, s| s.dispatch(list, x, y, z, flags));
     #[cfg(not(windows))]
     let _ = (this, x, y, z, flags);
 }
@@ -2059,13 +2055,13 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
-        with_state(this, |list, s| {
+        with_state_on(host_list_ordered(this), this, |list, s| {
             s.draw(list, vertices, instances, first, first_instance)
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
-        with_state(this, |list, s| s.dispatch(list, x, y, z, 0));
+        with_state_on(host_list_ordered(this), this, |list, s| s.dispatch(list, x, y, z, 0));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
@@ -2075,7 +2071,7 @@ mod state {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
         }
-        with_state(this, |list, s| s.dispatch_mesh(list, x));
+        with_state_on(host_list_ordered(this), this, |list, s| s.dispatch_mesh(list, x));
     }
     /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
     /// shortcut: dispatches whose group count is in GPU memory (indirect)
@@ -2093,7 +2089,7 @@ mod state {
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
             return;
         }
-        with_state(this, |list, s| s.dispatch_mesh(list, x));
+        with_state_on(host_list_ordered(this), this, |list, s| s.dispatch_mesh(list, x));
     }
     pub(super) extern "system" fn draw_indexed(
         this: This,
@@ -2104,7 +2100,7 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
-        with_state(this, |list, s| {
+        with_state_on(host_list_ordered(this), this, |list, s| {
             s.draw_indexed(list, indices, instances, first, base, first_instance)
         });
     }
@@ -2192,7 +2188,6 @@ extern "system" fn execute_indirect(
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
         with_state_on(host_list_held(this), this, |list, s| {
-            list.rf_x7_flush();
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
     } else {

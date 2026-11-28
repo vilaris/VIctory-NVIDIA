@@ -22,11 +22,6 @@ impl GlobalWait {
     }
 }
 
-/// Returns whether the new wait shares the already pending GPU command.
-fn queue_wait(pending: &mut bool) -> bool {
-    std::mem::replace(pending, true)
-}
-
 fn redundant_transition(before: i32, after: i32, full: bool) -> bool {
     full && before == after
 }
@@ -47,6 +42,7 @@ mod windows_impl {
         title: bool,
         narrow: bool,
         verify: bool,
+        validate: bool,
     }
 
     fn switches() -> &'static Switches {
@@ -58,6 +54,7 @@ mod windows_impl {
                 title: on("VICTORY_RF_X7_TITLE_UAV"),
                 narrow: on("VICTORY_RF_X7_NARROW"),
                 verify: on("VICTORY_RF_X7_VERIFY"),
+                validate: on("VICTORY_RF_X7_VALIDATE"),
             }
         })
     }
@@ -67,7 +64,11 @@ mod windows_impl {
     }
 
     pub(crate) fn tracking() -> bool {
-        switches().title || switches().verify || narrow()
+        switches().title || switches().verify
+    }
+
+    pub(crate) fn validating() -> bool {
+        switches().validate
     }
 
     pub(crate) fn possible_uav_access(shaders: Option<&crate::pipeline::host::HostPipeline>) -> bool {
@@ -105,8 +106,6 @@ mod windows_impl {
         consecutive: u64,
         consecutive_calls: u64,
         within_call: u64,
-        coalesced_calls: u64,
-        coalesced_enhanced: u64,
         draws: u64,
         dispatches: u64,
         gaps: u64,
@@ -190,62 +189,6 @@ mod windows_impl {
         s.within_call += count - 1;
     }
 
-    fn coalesced(count: u64) {
-        stats(|s| s.coalesced_calls += count);
-    }
-
-    pub(crate) fn mark_scoped_global() {
-        stats(|s| s.scoped_global += 1);
-    }
-
-    /// Run two adjacent legacy arrays as one ordered array. The caller
-    /// identifies adjacency at the point of recording, before any work.
-    #[track_caller]
-    pub(crate) fn adjacent_legacy(
-        list: &ID3D12GraphicsCommandList,
-        reason: &'static str,
-        first: &[D3D12_RESOURCE_BARRIER],
-        second: &[D3D12_RESOURCE_BARRIER],
-    ) {
-        // SAFETY: the callers provide an open list and live resources.
-        unsafe {
-            if narrow() && !first.is_empty() && !second.is_empty() {
-                coalesced(1);
-                let batch: Vec<_> = first.iter().chain(second).map(copy_barrier).collect();
-                victory_barriers(list, reason, &batch, None);
-            } else {
-                for barriers in [first, second].into_iter().filter(|b| !b.is_empty()) {
-                    victory_barriers(list, reason, barriers, None);
-                }
-            }
-        }
-    }
-
-    #[track_caller]
-    pub(crate) fn adjacent_title(
-        host: &crate::host::HostList,
-        reason: &'static str,
-        victory: &[D3D12_RESOURCE_BARRIER],
-    ) {
-        let list = &host.list;
-        if !victory.is_empty()
-            && let Some(mut title) = host.rf_x7_title()
-            && title.take_pending()
-        {
-            count_title(&[uav(None)]);
-            coalesced(1);
-            let batch: Vec<_> = std::iter::once(uav(None))
-                .chain(victory.iter().filter(|b| !redundant(b)).map(copy_barrier))
-                .collect();
-            // Count the translated input once per origin. Emit the array once.
-            account_victory(list, Site::at(reason, Location::caller()), victory);
-            stats(|s| s.dropped_transition += (victory.len() + 1 - batch.len()) as u64);
-            unsafe { crate::rf_x2::record_mixed(list, reason, &batch) };
-            return;
-        }
-        unsafe { victory_barriers(list, reason, victory, None) };
-    }
-
     fn copy_barrier(barrier: &D3D12_RESOURCE_BARRIER) -> D3D12_RESOURCE_BARRIER {
         // SAFETY: these unions hold borrowed pointers behind ManuallyDrop.
         unsafe { std::ptr::read(barrier) }
@@ -267,65 +210,6 @@ mod windows_impl {
             boundary(s, list, count);
             *s.globals.entry(site).or_default() += count;
         });
-    }
-
-    /// Merge only global groups whose masks can be unioned without crossing
-    /// a split barrier or a NO_ACCESS region. COMMON already covers all access
-    /// types supported by the combined sync scope.
-    ///
-    /// # Safety
-    /// The group payloads must be live and valid for the Barrier call.
-    pub(crate) unsafe fn merge_global_groups(groups: &[D3D12_BARRIER_GROUP]) -> Option<D3D12_GLOBAL_BARRIER> {
-        if !narrow() || groups.iter().any(|g| g.Type != D3D12_BARRIER_TYPE_GLOBAL) {
-            return None;
-        }
-        let count = groups.iter().map(|g| u64::from(g.NumBarriers)).sum::<u64>();
-        if count < 2 {
-            return None;
-        }
-        let mut merged: Option<D3D12_GLOBAL_BARRIER> = None;
-        for group in groups.iter().filter(|g| g.NumBarriers != 0) {
-            // SAFETY: the caller's Barrier group and its payload are live.
-            let globals = unsafe { std::slice::from_raw_parts(group.Anonymous.pGlobalBarriers, group.NumBarriers as usize) };
-            for b in globals {
-                if b.SyncBefore.0 & D3D12_BARRIER_SYNC_SPLIT.0 != 0
-                    || b.SyncAfter.0 & D3D12_BARRIER_SYNC_SPLIT.0 != 0
-                    || b.AccessBefore == D3D12_BARRIER_ACCESS_NO_ACCESS
-                    || b.AccessAfter == D3D12_BARRIER_ACCESS_NO_ACCESS
-                    || b.SyncBefore == D3D12_BARRIER_SYNC_NONE
-                    || b.SyncAfter == D3D12_BARRIER_SYNC_NONE
-                {
-                    return None;
-                }
-                merged = Some(match merged {
-                    None => *b,
-                    Some(a) => D3D12_GLOBAL_BARRIER {
-                        SyncBefore: union_sync(a.SyncBefore, b.SyncBefore),
-                        SyncAfter: union_sync(a.SyncAfter, b.SyncAfter),
-                        AccessBefore: union_access(a.AccessBefore, b.AccessBefore),
-                        AccessAfter: union_access(a.AccessAfter, b.AccessAfter),
-                    },
-                });
-            }
-        }
-        stats(|s| s.coalesced_enhanced += count - 1);
-        merged
-    }
-
-    fn union_sync(a: D3D12_BARRIER_SYNC, b: D3D12_BARRIER_SYNC) -> D3D12_BARRIER_SYNC {
-        if a == D3D12_BARRIER_SYNC_ALL || b == D3D12_BARRIER_SYNC_ALL {
-            D3D12_BARRIER_SYNC_ALL
-        } else {
-            a | b
-        }
-    }
-
-    fn union_access(a: D3D12_BARRIER_ACCESS, b: D3D12_BARRIER_ACCESS) -> D3D12_BARRIER_ACCESS {
-        if a == D3D12_BARRIER_ACCESS_COMMON || b == D3D12_BARRIER_ACCESS_COMMON {
-            D3D12_BARRIER_ACCESS_COMMON
-        } else {
-            a | b
-        }
     }
 
     fn redundant(b: &D3D12_RESOURCE_BARRIER) -> bool {
@@ -383,11 +267,13 @@ mod windows_impl {
         if supported { list.cast().ok() } else { None }
     }
 
+    #[track_caller]
     fn clamp_global(list: &ID3D12GraphicsCommandList7, reason: &str) {
-        // The title can produce arguments from graphics or compute UAVs.
+        // The title can produce arguments from graphics or compute UAVs
+        // or initialize them with a UAV clear.
         // The clamp consumes them as SRVs and updates the budget as a UAV.
         let accesses = [D3D12_GLOBAL_BARRIER {
-            SyncBefore: D3D12_BARRIER_SYNC_ALL_SHADING,
+            SyncBefore: D3D12_BARRIER_SYNC_ALL_SHADING | D3D12_BARRIER_SYNC_CLEAR_UNORDERED_ACCESS_VIEW,
             SyncAfter: D3D12_BARRIER_SYNC_COMPUTE_SHADING,
             AccessBefore: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
             AccessAfter: D3D12_BARRIER_ACCESS_SHADER_RESOURCE | D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
@@ -398,7 +284,7 @@ mod windows_impl {
             Anonymous: D3D12_BARRIER_GROUP_0 { pGlobalBarriers: accesses.as_ptr() },
         };
         // SAFETY: the list is open and the one group is backed by accesses.
-        unsafe { crate::rf_x2::record_global(list, reason, &[group]) };
+        unsafe { crate::rf_x2::record_enhanced(list, reason, &[group]) };
     }
 
     /// The optional scope is the complete set of resources touched by the
@@ -486,6 +372,7 @@ mod windows_impl {
         });
     }
 
+    #[track_caller]
     fn emit_title(list: &ID3D12GraphicsCommandList, barriers: &[D3D12_RESOURCE_BARRIER]) {
         count_title(barriers);
         // SAFETY: the recording is open and every resource pointer is live.
@@ -525,8 +412,7 @@ mod windows_impl {
             redundant_transition = s.redundant, dropped_transition = s.dropped_transition,
             narrowed_global = s.narrowed, scoped_global = s.scoped_global,
             consecutive = s.consecutive, consecutive_calls = s.consecutive_calls,
-            within_call = s.within_call, coalesced_calls = s.coalesced_calls,
-            coalesced_enhanced = s.coalesced_enhanced,
+            within_call = s.within_call,
             gaps = s.gaps, draws_between = s.draws, dispatches_between = s.dispatches,
             max_draws_between = s.max_draws, max_dispatches_between = s.max_dispatches,
             would_omit = s.would_omit, omitted = s.omitted,
@@ -542,70 +428,34 @@ mod windows_impl {
     #[derive(Default)]
     pub(crate) struct Title {
         wait: GlobalWait,
-        pending: bool,
     }
 
     impl Title {
-        pub(crate) fn flush(&mut self, list: &ID3D12GraphicsCommandList) {
-            if std::mem::take(&mut self.pending) {
-                emit_title(list, &[uav(None)]);
-            }
-        }
-
-        pub(crate) fn work(&mut self, list: &ID3D12GraphicsCommandList, uav_access: bool) {
-            self.flush(list);
+        pub(crate) fn work(&mut self, uav_access: bool) {
             self.wait.work(uav_access);
         }
 
-        pub(crate) fn shader_work(&mut self, list: &ID3D12GraphicsCommandList, uav_access: bool) {
+        pub(crate) fn shader_work(&mut self, uav_access: bool) {
             stats(|s| {
                 s.tracked_work += 1;
                 s.possible_uav_work += u64::from(uav_access);
             });
-            self.work(list, uav_access);
+            self.work(uav_access);
         }
 
-        /// Return the pending global to a caller that can record it in the
-        /// same array as the next barrier, with no work in between.
-        pub(crate) fn take_pending(&mut self) -> bool {
-            std::mem::take(&mut self.pending)
-        }
-
+        #[track_caller]
         fn barriers(&mut self, list: &ID3D12GraphicsCommandList, barriers: &[D3D12_RESOURCE_BARRIER]) {
             if barriers.len() == 1 && is_global(&barriers[0]) && plain_uav(&barriers[0]) {
-                if switches().title || switches().verify {
-                    let required = self.wait.wait();
-                    if !required {
-                        omitted();
-                    }
-                    if switches().verify || required {
-                        self.global(list, barriers);
-                    }
-                } else {
-                    self.global(list, barriers);
+                let required = self.wait.wait();
+                if !required {
+                    omitted();
                 }
-            } else {
-                if barriers.iter().any(|b| is_global(b) && plain_uav(b)) {
-                    self.wait.wait();
-                }
-                if self.take_pending() {
-                    let mut actual = Vec::with_capacity(1 + barriers.len());
-                    actual.push(uav(None));
-                    actual.extend(barriers.iter().map(copy_barrier));
-                    coalesced(1);
-                    emit_title(list, &actual);
-                } else {
+                if switches().verify || required {
                     emit_title(list, barriers);
                 }
-            }
-        }
-
-        fn global(&mut self, list: &ID3D12GraphicsCommandList, barriers: &[D3D12_RESOURCE_BARRIER]) {
-            if narrow() && !switches().verify {
-                if queue_wait(&mut self.pending) {
-                    coalesced(1);
-                }
             } else {
+                // A translated array can contain aliasing or state changes.
+                self.work(true);
                 emit_title(list, barriers);
             }
         }
@@ -622,6 +472,7 @@ mod windows_impl {
         });
     }
 
+    #[track_caller]
     pub(crate) fn title_barriers(host: &crate::host::HostList, barriers: &[D3D12_RESOURCE_BARRIER]) {
         stats(|s| boundary(s, &host.list, barriers.len() as u64));
         if let Some(mut title) = host.rf_x7_title() {
@@ -656,15 +507,6 @@ mod tests {
         wait.work(false);
         assert!(wait.wait());
         assert!(!wait.wait());
-    }
-
-    #[test]
-    fn joins_globals_only_while_a_wait_is_pending() {
-        let mut pending = false;
-        assert!(!queue_wait(&mut pending));
-        assert!(queue_wait(&mut pending));
-        assert!(std::mem::take(&mut pending));
-        assert!(!queue_wait(&mut pending));
     }
 
     #[test]
