@@ -156,7 +156,7 @@ mod runtime {
     }
 
     pub(crate) fn note_enabled() -> bool {
-        switches() != 0
+        switches() != 0 || crate::rf_x9::enabled()
     }
 
     /// Mark the actual heaps bound at this operation, retaining the list bit
@@ -165,14 +165,14 @@ mod runtime {
         if mask == 0 {
             return;
         }
-        if switches() & (PICK_GATE | PICKED) != 0 {
+        if switches() & (PICK_GATE | PICKED) != 0 || crate::rf_x9::enabled() {
             crate::heap_marks::note_pick(list);
         }
         for at in bound.into_iter().filter(|&at| at != 0) {
             let heap = crate::descriptor::heap(at as crate::object::This);
             let bit = if heap.samplers() { SAMPLERS } else { VIEWS };
             if mask & bit != 0 {
-                if verify() {
+                if verify() || crate::rf_x9::verify() {
                     heap.note_verify_reader(shader, pso, title);
                 }
                 heap.note_indexed();

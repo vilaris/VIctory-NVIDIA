@@ -864,7 +864,10 @@ pub(super) fn on() -> bool {
     }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        (std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1") || crate::list::thin::wanted()) && started()
+        (std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1")
+            || crate::list::thin::wanted()
+            || crate::rf_x9::enabled())
+            && started()
     })
 }
 

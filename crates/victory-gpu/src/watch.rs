@@ -1284,10 +1284,17 @@ impl Bits {
     /// Sets it; whether it was set already (so too of a block outside the
     /// address space, which has no bit).
     fn swap_on(&self, block: usize) -> bool {
-        use std::sync::atomic::Ordering::{AcqRel, Acquire, SeqCst};
+        use std::sync::atomic::Ordering::SeqCst;
         let word = block / 64;
+        self.reserve_piece(word);
+        let bit = 1 << (block % 64);
+        self.piece(word).is_none_or(|piece| piece[word % Bits::WORDS].fetch_or(bit, SeqCst) & bit != 0)
+    }
+
+    fn reserve_piece(&self, word: usize) {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
         let Some(place) = self.0.get(word / Bits::WORDS) else {
-            return true;
+            return;
         };
         if place.load(Acquire).is_null() {
             let piece: Box<BitsPiece> = Box::new([const { std::sync::atomic::AtomicU64::new(0) }; Bits::WORDS]);
@@ -1297,8 +1304,6 @@ impl Bits {
                 drop(unsafe { Box::from_raw(piece) });
             }
         }
-        let bit = 1 << (block % 64);
-        self.piece(word).is_none_or(|piece| piece[word % Bits::WORDS].fetch_or(bit, SeqCst) & bit != 0)
     }
 
     /// Sixty-four of them.
@@ -1510,6 +1515,40 @@ struct Opened {
 /// Those whose notes are not settled yet ([`settle`]), and how many.
 static OPENED: Mutex<Vec<Opened>> = Mutex::new(Vec::new());
 static TO_SETTLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static X9_OPENED: crate::rf_x9::FaultBitmap = crate::rf_x9::FaultBitmap::new();
+static X9_MAPPING: crate::rf_x9::MappingGate = crate::rf_x9::MappingGate::new();
+
+/// Opens single-view blocks whose bit storage was reserved by `install`.
+/// Hold a nonblocking map pin until the handoff is visible, so a remap
+/// cannot reuse the virtual block between the OS change and publication.
+fn open_x9(block: usize) -> bool {
+    if block >= crate::rf_x9::FAULT_BLOCKS || ALIASED.any(block, block + 1) {
+        return false;
+    }
+    let Some(_mapping) = X9_MAPPING.try_pin() else {
+        return false;
+    };
+    let Some(_demand_pin) = crate::demand::try_pin_fault(block) else {
+        return false;
+    };
+    if OPENING.swap_on(block) {
+        return false;
+    }
+    if !PROTECTED.any(block, block + 1) || ALIASED.any(block, block + 1) {
+        OPENING.clear(block);
+        return false;
+    }
+    BESIDE.set(block);
+    PUBLISHED.clear(block);
+    bump_write_blocks(block, block + 1);
+    if !make_writable(block, true) {
+        OPENING.clear(block);
+        return false;
+    }
+    PROTECTED.clear(block);
+    X9_OPENED.record(block);
+    true
+}
 
 /// Whether a write fault opens a guarded block without the guards' lock
 /// (`VICTORY_FAULT_UNLOCKED=1`; off unless asked for, or flipped while the
@@ -1624,6 +1663,25 @@ fn open_unlocked(block: usize, started: Option<std::time::Instant>, only_single:
 /// whoever takes the lock, before anything else ([`guards`]).
 fn settle(g: &mut Guards) {
     use std::sync::atomic::Ordering::SeqCst;
+    if crate::rf_x9::enabled() {
+        X9_OPENED.drain(|block| {
+            if g.aliased.contains(block) {
+                // Alias protection saw OPENING and could not publish the
+                // other views as clean. Invalidate any prior clean notes.
+                for other in crate::inplace::pages_of(block * BLOCK) {
+                    let other = other / BLOCK;
+                    g.clean.remove(other);
+                    PUBLISHED.clear(other);
+                }
+                g.unalias(block);
+            }
+            g.clean.remove(block);
+            g.protected.remove(block);
+            PUBLISHED.clear(block);
+            g.opened(block);
+            OPENING.clear(block);
+        });
+    }
     if TO_SETTLE.load(SeqCst) == 0 {
         return;
     }
@@ -3230,6 +3288,9 @@ impl Drop for Remapping {
             guards().changing.clear();
         }
         CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if crate::rf_x9::enabled() {
+            X9_MAPPING.reopen();
+        }
     }
 }
 
@@ -3379,6 +3440,9 @@ pub fn title_memory_remapping() -> Remapping {
         }
     }
     let changing = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    if crate::rf_x9::enabled() {
+        X9_MAPPING.close();
+    }
     CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     CHANGING.set((true, false));
     Remapping(changing)
@@ -3734,6 +3798,7 @@ pub(crate) fn install() {
         let at = r.ExceptionInformation[1];
         let block = at / BLOCK;
         let guarded = PROTECTED.any(block, block + 1);
+        let _x9_fault = guarded.then(|| crate::rf_x9::timer(crate::rf_x9::Work::Fault));
         let mut x5_fault = rf_x5::Fault::new(
             started, at, r.ExceptionAddress as usize, guarded,
         );
@@ -3744,6 +3809,19 @@ pub(crate) fn install() {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if guarded {
+            let x9 = crate::rf_x9::enabled();
+            if x9 {
+                if open_x9(block) {
+                    crate::rf_x9::bitmap_fault();
+                    x5_fault.handled();
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+                // Demand landing could have reserved the protection after
+                // the first check, before the fast opener attempted its pin.
+                if crate::demand::on_fault(at, ours.is_none()) {
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
             let legacy = unlocked();
             // X5 takes the existing bit-based opening path for a single view.
             // A concurrent remap or a known alias uses the locked path.
@@ -3764,7 +3842,7 @@ pub(crate) fn install() {
             }
             // Another thread is opening it so: writable in a few
             // microseconds, with no lock waited for.
-            if attempted && OPENING.any(block, block + 1) {
+            if (attempted || x9) && OPENING.any(block, block + 1) {
                 let began = std::time::Instant::now();
                 // Wait on the in-process bit, then query once. Querying the
                 // VM during every spin contends with the protection change.
@@ -3845,6 +3923,11 @@ pub(crate) fn install() {
     // SAFETY: the handler only touches our guard state and protections.
     ONCE.call_once(|| unsafe {
         rf_x5::init_stats();
+        crate::rf_x9::init_stats();
+        if crate::rf_x9::enabled() {
+            OPENING.reserve_piece(0);
+            BESIDE.reserve_piece(0);
+        }
         if rf_x5::settings().fast_fault || unlocked() {
             let mut g = lock_guards();
             g.opened_batch.reserve(64);
