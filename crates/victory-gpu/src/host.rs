@@ -3980,6 +3980,7 @@ fn merge_across() -> bool {
 fn stale_of(
     mut spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
 ) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
+    let _time = crate::rf_x9::timer(crate::rf_x9::Work::UnderFlights);
     if late_exact() {
         // The title's bytes are put in beside the flights' writes; a
         // settle is still due where that could not be done. At most this
@@ -6931,6 +6932,7 @@ impl Host {
         mut stale: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
         ranges: &[(usize, usize)],
     ) {
+        let _time = crate::rf_x9::timer(crate::rf_x9::Work::SettleStale);
         if relay_exact() && card_steps::stage() > 0 {
             for _ in 0..3 {
                 #[cfg(feature = "diagnostics")]
@@ -6995,7 +6997,7 @@ impl Host {
         // Else with [`heap_sync_first`]: the heaps' records begun now, beside
         // the planning of steps done on the card and the look at flights.
         let first_heaps = (late && needs_heaps && !x9_heaps_prepared && heaps_mark == 0
-            && (heap_sync_first() || (x9 && crate::descriptor::sync_aside())))
+            && heap_sync_first())
             .then(crate::descriptor::begin_sync_heaps);
         let ahead = Split::begin();
         SPLIT[11].fetch_add(called.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -7129,7 +7131,7 @@ impl Host {
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         let once = crate::watch::once();
-        let front = refresh_front() || (x9 && parts.len() <= 1 && ahead_of_writes());
+        let front = refresh_front();
         if once || front {
             batch.copy_spans(runs, front.then_some(parts.as_slice()));
         }

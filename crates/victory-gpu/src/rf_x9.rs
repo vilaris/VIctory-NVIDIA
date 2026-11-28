@@ -215,6 +215,8 @@ mod telemetry {
         Fill,
         Planning,
         HeapDiscovery,
+        UnderFlights,
+        SettleStale,
     }
 
     #[derive(Clone, Copy)]
@@ -230,13 +232,20 @@ mod telemetry {
         UploadRing,
     }
 
-    static WORK: [[AtomicU64; 2]; 10] =
-        [const { [const { AtomicU64::new(0) }; 2] }; 10];
+    static WORK: [[AtomicU64; 2]; 12] =
+        [const { [const { AtomicU64::new(0) }; 2] }; 12];
     static TRAFFIC: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
     static BITMAP: AtomicU64 = AtomicU64::new(0);
     static GAPS: AtomicU64 = AtomicU64::new(0);
     static WATCH_CHANGED: AtomicU64 = AtomicU64::new(0);
     static CPU_READ: AtomicU64 = AtomicU64::new(0);
+    static STALE: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+    pub(crate) fn stale_reason(reason: usize) {
+        if stats() {
+            STALE[reason].fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     pub(crate) struct Timer(Work, Instant);
 
@@ -287,14 +296,14 @@ mod telemetry {
             return;
         }
         let per_frame = |counter: &AtomicU64| counter.swap(0, Ordering::Relaxed) as f64 / frames;
-        let [refresh, descriptor, capture, fault, record_heap_wait, pack, texture, fill, plan, discovery] =
+        let [refresh, descriptor, capture, fault, record_heap_wait, pack, texture, fill, plan, discovery, under, settle] =
             WORK.each_ref().map(|row| [per_frame(&row[0]), per_frame(&row[1]) / 1e6]);
         let [scratch, upload, readback, descriptors, kernel, guard, untracked, texture_read, ring] =
             TRAFFIC.each_ref().map(|value| per_frame(value) / (1 << 20) as f64);
         let ms = split.map(|ns| ns as f64 / 1e6 / frames);
         tracing::info!(
-            "rf-x9: enabled={} frames={frames:.0} submit-ms[lock={:.3} plan={:.3} watch={:.3} flights={:.3} steps={:.3} refresh={:.3} snapshots={:.3} card={:.3} heaps={:.3} send={:.3}] jobs[count/ms per frame refresh={:.1}/{:.3} descriptor={:.1}/{:.3} capture={:.1}/{:.3} record-heap-wait={:.1}/{:.3}] faults[count/ms per frame={:.1}/{:.3} bitmap={:.1}] MiB/frame[upload-scratch={scratch:.2} card-up={upload:.2} gpu-down={readback:.2} descriptors-read={descriptors:.2} kernel-refresh={kernel:.2} guard-refresh={guard:.2} untracked-refresh={untracked:.2} gaps-excluded={:.2}] transitions/frame[watch={:.1} parked-eager={:.1}]",
-            super::enabled(), ms[11], ms[12] + ms[14], ms[0], ms[1] + ms[13], ms[2],
+            "rf-x9: enabled={} frames={frames:.0} submit-ms[lock={:.3} plan={:.3} watch={:.3} flights={:.3} flight-prereq={:.3} steps={:.3} refresh={:.3} snapshots={:.3} card={:.3} heaps={:.3} send={:.3}] jobs[count/ms per frame refresh={:.1}/{:.3} descriptor={:.1}/{:.3} capture={:.1}/{:.3} record-heap-wait={:.1}/{:.3}] faults[count/ms per frame={:.1}/{:.3} bitmap={:.1}] MiB/frame[upload-scratch={scratch:.2} card-up={upload:.2} gpu-down={readback:.2} descriptors-read={descriptors:.2} kernel-refresh={kernel:.2} guard-refresh={guard:.2} untracked-refresh={untracked:.2} gaps-excluded={:.2}] transitions/frame[watch={:.1} parked-eager={:.1}]",
+            super::enabled(), ms[11], ms[12] + ms[14], ms[0], ms[1], ms[13], ms[2],
             ms[6], ms[3], ms[4], ms[15], ms[5], refresh[0], refresh[1], descriptor[0],
             descriptor[1], capture[0], capture[1], record_heap_wait[0], record_heap_wait[1],
             fault[0], fault[1], per_frame(&BITMAP),
@@ -304,6 +313,11 @@ mod telemetry {
         tracing::info!(
             "rf-x9: jobs[count/ms per frame upload-pack={:.1}/{:.3} texture={:.1}/{:.3} fill={:.1}/{:.3} planning={:.1}/{:.3} heap-discovery={:.1}/{:.3}] MiB/frame[texture-read={texture_read:.2} upload-ring={ring:.2}]",
             pack[0], pack[1], texture[0], texture[1], fill[0], fill[1], plan[0], plan[1], discovery[0], discovery[1],
+        );
+        let [untracked, unknown, budget, snapshot] = STALE.each_ref().map(per_frame);
+        tracing::info!(
+            "rf-x9: flights[count/ms per frame merge={:.1}/{:.3} settle-and-recheck={:.1}/{:.3}] merge-fallbacks/frame[untracked-or-dirty={untracked:.1} unknown-writes={unknown:.1} changed-runs={budget:.1} no-snapshot={snapshot:.1}]",
+            under[0], under[1], settle[0], settle[1],
         );
     }
 }

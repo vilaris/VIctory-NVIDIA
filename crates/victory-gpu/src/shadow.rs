@@ -2429,6 +2429,7 @@ static STALE_WHY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsiz
 
 fn note_stale(why: usize) {
     STALE_WHY.store(why, Ordering::Relaxed);
+    crate::rf_x9::stale_reason(why);
 }
 
 /// [`STALE_WHY`] in words (diagnostics).
@@ -3236,6 +3237,27 @@ mod piece_tests {
 ///
 /// Use 4 KiB stamps wherever available so a write to one part does not
 /// force a read and comparison of the rest of its 64 KiB page.
+fn flight_page_candidates<'a>(
+    copied: &[u64],
+    base: usize,
+    pages: std::ops::Range<usize>,
+    written: &'a [(usize, u64)],
+    sparse: bool,
+) -> impl Iterator<Item = (usize, u64)> + use<'a> {
+    let first = written.partition_point(|&(page, _)| page < pages.start);
+    let last = written.partition_point(|&(page, _)| page < pages.end);
+    let written = &written[first..last];
+    // Uninitialized pages must still be visited even if the journal never
+    // saw a write to them. Once the entire interval has stamps, the journal
+    // entries are the only pages that can have a newer version.
+    let sparse = sparse && written.len() < pages.len() / 2
+        && copied[pages.start - base..pages.end - base].iter().all(|&stamp| stamp != 0);
+    let (all, changed) = if sparse { (pages.start..pages.start, written) } else { (pages, &[][..]) };
+    let mut by_page = written.iter().copied().peekable();
+    all.map(move |page| (page, by_page.next_if(|&(p, _)| p == page).map_or(0, |(_, version)| version)))
+        .chain(changed.iter().copied())
+}
+
 fn stale_ranges_in(
     base: usize,
     copied: &[u64],
@@ -3262,10 +3284,11 @@ fn stale_ranges_in(
     };
     let first = (a / PAGE).max(base);
     let last = e.div_ceil(PAGE).min(base + copied.len());
-    let mut writes = written.iter().skip_while(|&&(page, _)| page < first).peekable();
-    for page in first..last {
+    if first >= last {
+        return stale;
+    }
+    for (page, write) in flight_page_candidates(copied, base, first..last, written, crate::rf_x9::enabled()) {
         let at = copied[page - base];
-        let write = writes.next_if(|&&(p, _)| p == page).map_or(0, |&(_, write)| write);
         if at != 0 && write <= at {
             continue;
         }
@@ -3295,6 +3318,42 @@ fn stale_ranges_in(
         }
     }
     stale
+}
+
+#[test]
+fn flight_candidates_skip_clean_pages_only_after_the_full_range_was_initialized() {
+    let writes = [(9, 2), (13, 3), (18, 4)];
+    let copied = [1; 8];
+    let pages = 10..18;
+    assert_eq!(flight_page_candidates(&copied, 10, pages.clone(), &writes, true).collect::<Vec<_>>(), [(13, 3)]);
+    let mut partial = copied;
+    partial[5] = 0;
+    let dense: Vec<_> = flight_page_candidates(&copied, 10, pages.clone(), &writes, false).collect();
+    assert_eq!(flight_page_candidates(&partial, 10, pages, &writes, true).collect::<Vec<_>>(), dense);
+    assert_eq!(dense[5], (15, 0));
+}
+
+fn flight_stale_ranges(
+    base: usize,
+    copied: &[u64],
+    parts: &crate::watch::PartsTaken,
+    from: usize,
+    to: usize,
+    written: &[(usize, u64)],
+) -> Vec<(usize, usize)> {
+    if !crate::rf_x9::enabled() || written.len() < 2 {
+        return stale_ranges_in(base, copied, parts, from, to, written, &crate::watch::part_write);
+    }
+    // Take one journal read lock for the pages that may need a subpage
+    // comparison. A descriptor round can publish other pages concurrently.
+    let pages: Vec<_> = written.iter().filter_map(|&(page, version)| {
+        copied.get(page.checked_sub(base)?)
+            .filter(|&&stamp| version > stamp)
+            .map(|_| page)
+    }).collect();
+    let stamps = crate::watch::part_writes(&pages);
+    let each = |page| pages.binary_search(&page).ok().and_then(|i| stamps[i]);
+    stale_ranges_in(base, copied, parts, from, to, written, &each)
 }
 
 /// The parts of a page: 4 KiB each, as the kernel names them.
@@ -4605,7 +4664,7 @@ impl Shadow {
         busy.into_iter().any(|(a, e)| match crate::watch::asked(a, e) {
             Some((_, written)) => {
                 let parts = self.parts_taken.lock().unwrap_or_else(|e| e.into_inner());
-                !stale_ranges_in(base, &copied, &parts, a, e, &written, &crate::watch::part_write).is_empty()
+                !flight_stale_ranges(base, &copied, &parts, a, e, &written).is_empty()
             }
             None => true,
         })
@@ -4670,7 +4729,7 @@ impl Shadow {
             let stale = {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 let parts = self.parts_taken.lock().unwrap_or_else(|e| e.into_inner());
-                stale_ranges_in(base, &copied, &parts, a, e, &written, &crate::watch::part_write)
+                flight_stale_ranges(base, &copied, &parts, a, e, &written)
             };
             if stale.is_empty() {
                 continue;

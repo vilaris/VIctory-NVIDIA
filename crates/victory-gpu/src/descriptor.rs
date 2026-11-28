@@ -375,7 +375,7 @@ fn sync_on() -> bool {
 /// before the lists go to the queue, and nothing of the preparing looks at
 /// them (what a draw reads through a table it made itself, when recorded).
 #[cfg(windows)]
-pub(crate) fn sync_aside() -> bool {
+fn sync_aside() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| sync_on() && std::env::var_os("VICTORY_HEAP_SYNC_ASIDE").is_none_or(|v| v != "0"))
 }
