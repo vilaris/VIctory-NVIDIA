@@ -4032,6 +4032,14 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_impl::<true>(index, handle, for_draw)
+    }
+
+    pub(super) fn mirror_copied(&self, index: u32, handle: u64) {
+        self.mirror_impl::<false>(index, handle, false);
+    }
+
+    fn mirror_impl<const RETURN_VIEW: bool>(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -4057,9 +4065,15 @@ impl HostHeap {
         if tag == VIEW_TAG
             && quick_mirror()
             && self.quick.get(index as usize).is_some_and(|k| k.load(std::sync::atomic::Ordering::Acquire) == key)
-            && let Some(view) = view_at(i, generation)
         {
-            return Some(view);
+            // Inlined constants and placed shapes do not recycle their
+            // identity. The quick key already proved the shape existed.
+            if !RETURN_VIEW && matches!(generation >> super::KIND_SHIFT, super::CONSTANT | super::PLACED) {
+                return None;
+            }
+            if let Some(view) = view_at(i, generation) {
+                return Some(view);
+            }
         }
         let held = self.made.lock(index);
         let shown = self.made.get(index).unwrap_or(0);
@@ -4195,6 +4209,35 @@ impl HostHeap {
     /// would find before it did nothing for one that holds no view.
     pub(crate) fn shows_none(&self, index: u32) -> bool {
         self.made.get(index).unwrap_or(0) == 0
+    }
+
+    /// A different published key, when the original round would have made
+    /// this record immediately. Deferrals still use the existing readiness
+    /// checks and their own lifetime handling.
+    pub(super) fn verify_mirrored(&self, index: u32, [tag, i, generation]: [u32; 3], frame: u64) -> Option<u64> {
+        let shown = self.made.get(index).unwrap_or(0);
+        let key = u64::from(generation) << 32 | u64::from(i);
+        if tag == VIEW_TAG && !self.sampler && (self.copied_tabled(index, frame)
+            || self.copied_waits() && matches!(generation >> super::KIND_SHIFT, super::CONSTANT | super::PLACED))
+        {
+            return None;
+        }
+        let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
+        let Some(view) = view else {
+            return (shown != 0).then_some(shown);
+        };
+        if shown == key {
+            return None;
+        }
+        if view.is_buffer() || view.waiting_texture().is_some() {
+            return None;
+        }
+        if !self.sampler && is_texture_view(&view)
+            && NEW_PENDING.lock().unwrap_or_else(|e| e.into_inner()).contains(&(std::ptr::from_ref(self) as usize, index, key))
+        {
+            return None;
+        }
+        Some(shown)
     }
 
     /// Slot `index` is made from record `key` and stays so (0: not). Under
@@ -5475,14 +5518,33 @@ impl Copied<'_> {
     /// # Safety
     /// No other call beside this one has any of these slots.
     pub(crate) unsafe fn changes(&self, first: u32, records: &[u8], out: &mut Vec<u32>) {
+        // SAFETY: the caller owns these slots for this call.
+        unsafe { self.compare::<false>(first, records, out, false) };
+    }
+
+    /// X4 comparisons, with the number of individual records inspected.
+    ///
+    /// # Safety
+    /// As for `changes`.
+    pub(super) unsafe fn changes_x4(&self, first: u32, records: &[u8], out: &mut Vec<u32>, blocks: bool) -> u64 {
+        // SAFETY: the caller owns these slots for this call.
+        unsafe { self.compare::<true>(first, records, out, blocks) }
+    }
+
+    unsafe fn compare<const COUNT: bool>(&self, first: u32, records: &[u8], out: &mut Vec<u32>, blocks: bool) -> u64 {
         let at = first as usize * self.step;
         let end = (at + records.len()).min(self.len);
         if at >= end {
-            return;
+            return 0;
         }
         // SAFETY: within the records held; the caller's slots alone.
         let last = unsafe { std::slice::from_raw_parts_mut(self.at.add(at), end - at) };
-        changed_records(last, &records[..end - at], self.step, first, out);
+        let now = &records[..end - at];
+        if blocks {
+            super::rf_x4::changes(last, now, self.step, first, out)
+        } else {
+            changed_records_count::<COUNT>(last, now, self.step, first, out)
+        }
     }
 
     /// As [`Copied::changes`] for the `count` records of title memory at
@@ -5532,12 +5594,20 @@ impl Copied<'_> {
 /// between `last` and `records` (of one length) go into `out` and `last`.
 /// Most of a changed page is as it was: it is looked at sixteen records at a
 /// time.
-fn changed_records(last: &mut [u8], records: &[u8], step: usize, first: u32, out: &mut Vec<u32>) {
+pub(super) fn changed_records(last: &mut [u8], records: &[u8], step: usize, first: u32, out: &mut Vec<u32>) {
+    changed_records_count::<false>(last, records, step, first, out);
+}
+
+fn changed_records_count<const COUNT: bool>(last: &mut [u8], records: &[u8], step: usize, first: u32, out: &mut Vec<u32>) -> u64 {
     const AT_A_TIME: usize = 16;
     let block = AT_A_TIME * step;
+    let mut compared = 0;
     for (b, (old, new)) in last.chunks_mut(block).zip(records.chunks(block)).enumerate() {
         if old == new {
             continue;
+        }
+        if COUNT {
+            compared += (old.len() / step) as u64;
         }
         for (n, (old, new)) in old.chunks_exact_mut(step).zip(new.chunks_exact(step)).enumerate() {
             if old != new {
@@ -5546,6 +5616,7 @@ fn changed_records(last: &mut [u8], records: &[u8], step: usize, first: u32, out
             }
         }
     }
+    compared
 }
 
 #[cfg(test)]
