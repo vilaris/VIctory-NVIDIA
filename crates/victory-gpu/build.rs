@@ -17,6 +17,19 @@ fn files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 fn main() {
     let here = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap_or_default());
+    // A pinned fingerprint (`translator.pin` beside this file, one hex line):
+    // the caches stay valid across builds until the file is deleted. Delete
+    // it whenever the translator really changes, or stale DXIL is reused.
+    let pin = here.join("translator.pin");
+    println!("cargo:rerun-if-changed={}", pin.display());
+    if let Ok(text) = std::fs::read_to_string(&pin) {
+        let value = text.trim();
+        if !value.is_empty() {
+            println!("cargo:warning=translator fingerprint pinned by {}: {value}", pin.display());
+            println!("cargo:rustc-env=VICTORY_TRANSLATOR={value}");
+            return;
+        }
+    }
     let crates = here.join("..");
     let root = crates.join("..");
     // The translator, what it is built from, and the form entries are kept in.
