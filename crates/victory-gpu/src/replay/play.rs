@@ -2428,7 +2428,7 @@ impl Player {
                     AccessBefore: D3D12_BARRIER_ACCESS_COMMON,
                     AccessAfter: D3D12_BARRIER_ACCESS_COMMON,
                 }];
-                list.Barrier(&[D3D12_BARRIER_GROUP {
+                crate::rf_x2::record_enhanced(&list, "vx:barrier.replay", &[D3D12_BARRIER_GROUP {
                     Type: D3D12_BARRIER_TYPE_GLOBAL,
                     NumBarriers: 1,
                     Anonymous: D3D12_BARRIER_GROUP_0 {

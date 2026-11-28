@@ -96,6 +96,8 @@ mod rf_x3;
 #[cfg(any(windows, test))]
 mod rf_x7;
 mod rf_x9;
+#[cfg(windows)]
+mod rf_x7_validate;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
