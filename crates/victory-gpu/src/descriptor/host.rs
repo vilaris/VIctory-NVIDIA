@@ -96,7 +96,7 @@ impl ChangedSlots {
     fn new(count: usize) -> Self {
         Self {
             slots: Slots::new(count),
-            words: crate::rf_x9::incremental_bindless().then(|| Slots::new(count.div_ceil(64))),
+            words: crate::rf_x9::bindless_at_submit().then(|| Slots::new(count.div_ceil(64))),
         }
     }
 

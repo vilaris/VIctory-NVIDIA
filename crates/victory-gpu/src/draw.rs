@@ -2373,7 +2373,7 @@ impl State {
                         None
                     }
                 };
-                if !self.root_uav(list, address, param, compute, writes) {
+                if !self.root_uav(list, address, param, compute, writes, (&stage.shader.hash, slot)) {
                     return false;
                 }
             }
@@ -2402,6 +2402,7 @@ impl State {
         param: u32,
         compute: bool,
         writes: bool,
+        (shader, slot): (&str, u8),
     ) -> bool {
         const UNORDERED: i32 = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0;
         static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -2432,7 +2433,11 @@ impl State {
                 crate::host::wide_write(a, len, pipeline);
                 // The footprint this pipeline's shader wrote through this
                 // parameter, once learned (`VICTORY_TIGHT_WRITES=1`).
-                let (from, n) = crate::tight::declare(pipeline, param, s.id(), s.span().0, a, len);
+                let (from, n) = if list.capture_x9_root_uav(shader, slot, s, a, len) {
+                    (0, len)
+                } else {
+                    crate::tight::declare(pipeline, param, s.id(), s.span().0, a, len)
+                };
                 s.gpu_writes(list, a + from, n);
             }
         };

@@ -1180,7 +1180,7 @@ impl Tracked {
     /// Only complete watch blocks which X4 will compare are eligible.
     pub(crate) fn take_descriptors(&self, to: usize, mirrored_end: usize) -> Vec<(usize, usize)> {
         let end = mirrored_end.min(to).min(self.end);
-        let descriptor = if rf_x5::settings().always_dirty && end > self.start {
+        let descriptor = if rf_x5::descriptor_heat() && end > self.start {
             self.start.div_ceil(BLOCK)..end / BLOCK
         } else {
             0..0
@@ -1517,11 +1517,12 @@ static OPENED: Mutex<Vec<Opened>> = Mutex::new(Vec::new());
 static TO_SETTLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static X9_OPENED: crate::rf_x9::FaultBitmap = crate::rf_x9::FaultBitmap::new();
 static X9_MAPPING: crate::rf_x9::MappingGate = crate::rf_x9::MappingGate::new();
+static X9_FAULT_TIMES: std::sync::OnceLock<Box<[std::sync::atomic::AtomicU64]>> = std::sync::OnceLock::new();
 
 /// Opens single-view blocks whose bit storage was reserved by `install`.
 /// Hold a nonblocking map pin until the handoff is visible, so a remap
 /// cannot reuse the virtual block between the OS change and publication.
-fn open_x9(block: usize) -> bool {
+fn open_x9(block: usize, started: Option<std::time::Instant>) -> bool {
     if block >= crate::rf_x9::FAULT_BLOCKS || ALIASED.any(block, block + 1) {
         return false;
     }
@@ -1547,6 +1548,10 @@ fn open_x9(block: usize) -> bool {
         return false;
     }
     PROTECTED.clear(block);
+    if let Some(times) = X9_FAULT_TIMES.get() {
+        let ns = started.map_or(0, |t| t.elapsed().as_nanos() as u64);
+        times[block].store(ns, std::sync::atomic::Ordering::Relaxed);
+    }
     X9_OPENED.record(block);
     true
 }
@@ -1680,6 +1685,10 @@ fn settle(g: &mut Guards) {
             g.protected.remove(block);
             PUBLISHED.clear(block);
             g.opened(block);
+            if let Some(times) = X9_FAULT_TIMES.get() {
+                let ns = times[block].swap(0, std::sync::atomic::Ordering::Relaxed);
+                g.record_fault(block, rf_x5::frame(), rf_x5::submission(), ns);
+            }
             OPENING.clear(block);
         });
     }
@@ -2223,14 +2232,15 @@ struct GuardHistory {
 impl Guards {
     fn record_fault(&mut self, block: usize, frame: u64, submission: u64, ns: u64) {
         let settings = rf_x5::settings();
-        if !(settings.always_dirty || settings.lazy_rearm) || !view_guard() {
+        let descriptor_heat = rf_x5::descriptor_heat();
+        if !(descriptor_heat || settings.lazy_rearm) || !view_guard() {
             return;
         }
         if self.x5.len() >= 1 << 16 && !self.x5.contains_key(&block) {
             if self.x5_pruned.is_none_or(|last| submission.saturating_sub(last) >= 64) {
                 self.x5_pruned = Some(submission);
                 self.x5.retain(|&b, h| deferred(b, b + 1)
-                    || settings.always_dirty && h.heat.retain(frame)
+                    || descriptor_heat && h.heat.retain(frame)
                     || h.submission != 0 && h.submission == submission);
             }
             if self.x5.len() >= 1 << 16 {
@@ -2238,7 +2248,7 @@ impl Guards {
             }
         }
         let history = self.x5.entry(block).or_default();
-        if settings.always_dirty {
+        if descriptor_heat {
             history.heat.fault(frame, ns, settings);
         }
         if settings.lazy_rearm {
@@ -2609,7 +2619,7 @@ fn guard_view(start: usize, end: usize, consume: bool, descriptor: Range<usize>)
     }
     let mut run: Option<(usize, usize)> = None;
     let settings = rf_x5::settings();
-    let delay = settings.always_dirty || settings.lazy_rearm;
+    let delay = rf_x5::descriptor_heat() || settings.lazy_rearm;
     let (frame, submission) = if delay { (rf_x5::frame(), rf_x5::submission()) } else { (0, 0) };
     for &block in &written {
         if let Some((from, to)) = run
@@ -2663,6 +2673,9 @@ fn guard_view(start: usize, end: usize, consume: bool, descriptor: Range<usize>)
                 }
                 if hot {
                     rf_x5::descriptor_deferred();
+                    if crate::rf_x9::defer_descriptor_rearm() {
+                        crate::rf_x9::descriptor_rearm_deferred();
+                    }
                 }
             } else if can_arm {
                 let finished = rf_x5::push_block(&mut run, block);
@@ -3812,7 +3825,7 @@ pub(crate) fn install() {
         if guarded {
             let x9 = crate::rf_x9::enabled();
             if x9 {
-                if open_x9(block) {
+                if open_x9(block, started) {
                     crate::rf_x9::bitmap_fault();
                     x5_fault.handled();
                     return EXCEPTION_CONTINUE_EXECUTION;
@@ -3928,6 +3941,10 @@ pub(crate) fn install() {
         if crate::rf_x9::enabled() {
             OPENING.reserve_piece(0);
             BESIDE.reserve_piece(0);
+        }
+        if crate::rf_x9::defer_descriptor_rearm() {
+            X9_FAULT_TIMES.get_or_init(|| (0..crate::rf_x9::FAULT_BLOCKS)
+                .map(|_| std::sync::atomic::AtomicU64::new(0)).collect());
         }
         if rf_x5::settings().fast_fault || unlocked() {
             let mut g = lock_guards();

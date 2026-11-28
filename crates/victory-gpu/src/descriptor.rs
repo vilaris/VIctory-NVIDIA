@@ -302,10 +302,10 @@ impl RetainedHeap {
         unsafe { &*(self.0 as *const Heap) }
     }
 
-    pub(crate) fn range(&self) -> (usize, usize) {
+    pub(crate) fn mirrored_range(&self) -> Option<(usize, usize)> {
         let heap = self.get();
-        let bytes = usize::try_from(heap.desc.count).unwrap_or(0) * increment(heap.desc.kind).unwrap_or(0) as usize;
-        (heap.start as usize, (heap.start as usize).saturating_add(bytes))
+        let stride = increment(heap.desc.kind)? as usize;
+        Some(crate::rf_x9::mirrored_heap_span(heap.start as usize, heap.desc.count, heap.host()?.count(), stride))
     }
 }
 
