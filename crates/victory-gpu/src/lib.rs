@@ -93,6 +93,8 @@ mod residency;
 mod rf_x2; // rf-x2
 #[cfg(any(windows, test))]
 mod rf_x3;
+#[cfg(any(windows, test))]
+mod rf_x7;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]

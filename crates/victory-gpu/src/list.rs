@@ -251,6 +251,14 @@ fn discard_thin_state(this: This) {
 /// indirect execution held back first ([`crate::host::HostList::title_call`]).
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
+    let list = host_list_ordered(this)?;
+    list.rf_x7_opaque();
+    Some(list)
+}
+
+/// A barrier or direct dispatch models its own GPU accesses.
+#[cfg(windows)]
+fn host_list_ordered<'a>(this: This) -> Option<&'a crate::host::HostList> {
     let list = host_list_held(this)?;
     list.title_call();
     Some(list)
@@ -973,14 +981,24 @@ const UAV_BARRIER: Barrier = Barrier {
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
+    if let Some(list) = host_list_ordered(this)
         && !barriers.is_null()
     {
         if count > 0 {
-            with_state(this, |_, state| state.synced());
+            with_state_on(host_list_ordered(this), this, |_, state| state.synced());
         }
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
+        if crate::rf_x7::collecting() {
+            let (mut named, mut global) = (0, 0);
+            for b in barriers.iter().filter(|b| b.kind == 2) {
+                named += u64::from(!b.first.is_null());
+                global += u64::from(b.first.is_null());
+            }
+            if named + global != 0 {
+                crate::rf_x7::title_requests("ResourceBarrier", named, global);
+            }
+        }
         let mut host: Vec<Barrier> = barriers
             .iter()
             .filter_map(|b| host_barrier(list, b))
@@ -1054,7 +1072,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
                 )
             };
             // SAFETY: an open list and live resources.
-            unsafe { crate::rf_x2::title_barriers(&list.list, host) }; // rf-x2
+            crate::rf_x7::title_barriers(list, host);
         }
     }
     0
@@ -1725,7 +1743,7 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
 extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     count_dispatch();
     #[cfg(windows)]
-    with_state(this, |list, s| s.dispatch(list, x, y, z, flags));
+    with_state_on(host_list_ordered(this), this, |list, s| s.dispatch(list, x, y, z, flags));
     #[cfg(not(windows))]
     let _ = (this, x, y, z, flags);
 }
@@ -1810,8 +1828,9 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size: u64) {
     #[cfg(windows)]
     {
-        with_state(this, |_, state| state.synced());
-        if let Some(list) = host_list(this) {
+        with_state_on(host_list_ordered(this), this, |_, state| state.synced());
+        if let Some(list) = host_list_ordered(this) {
+            crate::rf_x7::title_requests("Sync", 0, 1);
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             #[cfg(feature = "diagnostics")]
             {
@@ -1838,7 +1857,7 @@ extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size
                 // SAFETY: the same layout; no resource named.
                 let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
                 // SAFETY: an open list.
-                unsafe { crate::rf_x2::title_barriers(&list.list, &[barrier]) }; // rf-x2
+                crate::rf_x7::title_barriers(list, &[barrier]);
             }
         }
     }
@@ -2034,13 +2053,13 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
-        with_state(this, |list, s| {
+        with_state_on(host_list_ordered(this), this, |list, s| {
             s.draw(list, vertices, instances, first, first_instance)
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
-        with_state(this, |list, s| s.dispatch(list, x, y, z, 0));
+        with_state_on(host_list_ordered(this), this, |list, s| s.dispatch(list, x, y, z, 0));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
@@ -2167,6 +2186,7 @@ extern "system" fn execute_indirect(
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
         with_state_on(host_list_held(this), this, |list, s| {
+            list.rf_x7_opaque();
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
     } else {
@@ -2411,10 +2431,11 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     }
     #[cfg(windows)]
     if count > 0
-        && let Some(list) = host_list(this)
+        && let Some(list) = host_list_ordered(this)
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
-        with_state(this, |_, state| state.synced());
+        with_state_on(host_list_ordered(this), this, |_, state| state.synced());
+        crate::rf_x7::title_requests("BarrierGroups", 0, 1);
         // (none where the last one in the list had nothing recorded after it:
         // `VICTORY_MERGE_BARRIERS`)
         if list.wait_for_writes() {
@@ -2422,7 +2443,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
             // SAFETY: the same layout; no resource named.
             let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
             // SAFETY: an open list.
-            unsafe { crate::rf_x2::title_barriers(&list.list, &[barrier]) }; // rf-x2
+            crate::rf_x7::title_barriers(list, &[barrier]);
         }
     }
     #[cfg(not(windows))]

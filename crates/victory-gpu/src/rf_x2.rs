@@ -299,19 +299,31 @@ fn count_barriers(barriers: &[D3D12_RESOURCE_BARRIER], offset: usize) {
 
 /// Records the enhanced global synchronization used by placed copies.
 #[inline]
+#[track_caller]
 pub(crate) unsafe fn global_barrier(list: &ID3D12GraphicsCommandList7, groups: &[D3D12_BARRIER_GROUP]) {
+    crate::rf_x7::enhanced_globals(groups); // rf-x7
+    unsafe { record_global(list, "vx:barrier.place", groups) };
+}
+
+pub(crate) unsafe fn record_global(list: &ID3D12GraphicsCommandList7, reason: &str, groups: &[D3D12_BARRIER_GROUP]) {
     if switches().stats {
         let count = groups.iter().map(|group| u64::from(group.NumBarriers)).sum();
         TOTALS[GLOBAL_BARRIERS].fetch_add(count, Relaxed);
     }
-    let _range = range(list, "vx:barrier.place");
+    let _range = range(list, reason);
     // SAFETY: the original Barrier call's preconditions apply.
     unsafe { list.Barrier(groups) };
 }
 
 /// Records Victory's own barriers at the original call site.
 #[inline]
-pub(crate) unsafe fn barriers(list: &ID3D12GraphicsCommandList, reason: &str, barriers: &[D3D12_RESOURCE_BARRIER]) {
+#[track_caller]
+pub(crate) unsafe fn barriers(list: &ID3D12GraphicsCommandList, reason: &'static str, barriers: &[D3D12_RESOURCE_BARRIER]) {
+    unsafe { crate::rf_x7::victory_barriers(list, reason, barriers, None) }; // rf-x7
+}
+
+#[inline]
+pub(crate) unsafe fn record_barriers(list: &ID3D12GraphicsCommandList, reason: &str, barriers: &[D3D12_RESOURCE_BARRIER]) {
     if switches().stats {
         count_barriers(barriers, 0);
     }
@@ -442,6 +454,7 @@ struct Sample {
 
 #[inline]
 pub(crate) fn frame(frame: u64) {
+    crate::rf_x7::frame(frame); // rf-x7
     if !switches().stats {
         return;
     }

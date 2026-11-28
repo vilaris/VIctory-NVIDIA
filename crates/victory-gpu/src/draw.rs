@@ -540,6 +540,9 @@ pub(crate) struct State {
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
     host_heaps_set: bool,
+    /// The last pipeline checked for immutable RF X7 bindings. Its PSO is
+    /// held by this recording, so the pointer cannot be reused in the cache.
+    rf_x7_roots: Option<(usize, bool)>,
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
@@ -1386,6 +1389,7 @@ impl State {
     pub(crate) fn set_pipeline(&mut self, pipeline: This) {
         self.rebound(OTHERS, self.pipeline != pipeline as usize);
         self.pipeline = pipeline as usize;
+        self.rf_x7_roots = None;
     }
 
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
@@ -1617,6 +1621,7 @@ impl State {
     /// the targets (a descriptor rewritten in between names another view).
     pub(crate) fn replay(&mut self, list: &HostList) {
         self.host_pipeline = 0;
+        self.rf_x7_roots = None;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
         self.host_heaps_set = false;
@@ -2332,6 +2337,9 @@ impl State {
         };
         let pipeline = self.pipeline;
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
+            if let Some(mut title) = list.rf_x7_title() {
+                title.root(s, writes, true);
+            }
             let len = s.left(a).min(limit);
             list.rf_x3_shadow(s, crate::rf_x3::Access::Uav, a, len, writes);
             s.refresh(list, a, len);
@@ -2483,6 +2491,9 @@ impl State {
         // buffer is brought up to date. The first 1 MiB only left what lay
         // past it stale (most mesh vertex streams reach further).
         if let Some((a, s)) = &shadow {
+            if let Some(mut title) = list.rf_x7_title() {
+                title.root(s, false, false);
+            }
             list.rf_x3_shadow(s, crate::rf_x3::Access::Srv, *a, s.left(*a), false);
             s.refresh(list, *a, s.left(*a));
         }
@@ -3905,7 +3916,12 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        if let Some(mut title) = list.rf_x7_title() {
+            let known = self.rf_x7_bounded_roots(list, p);
+            title.begin(&list.list, known);
+        }
         if !self.bind(list, p, true) {
+            list.rf_x7_opaque();
             DROPPED.add(1);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
@@ -3938,6 +3954,9 @@ impl State {
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
             }
         }
+        if let Some(mut title) = list.rf_x7_title() {
+            title.shader_work(&list.list);
+        }
         list.gpu_pass(true, self.pipeline, crate::host::render_trace::Command("dispatch", [x.into(), y.into(), z.into(), flags.into(), 0]), || p.name.clone());
         trace.recorded();
         list.gpu_uav_work();
@@ -3947,11 +3966,46 @@ impl State {
         DISPATCHED.add(1);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on()
-            && self.ambient(list, p, role)
         {
-            self.host_pipeline = 0;
-            self.host_roots[1] = 0;
+            list.rf_x7_opaque();
+            if self.ambient(list, p, role) {
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
+            }
         }
+    }
+
+    fn rf_x7_bounded_roots(&mut self, list: &HostList, p: &HostPipeline) -> bool {
+        let key = p.pso.as_raw() as usize;
+        if let Some((last, known)) = self.rf_x7_roots && last == key {
+            return known;
+        }
+        // Root views have verifiable bounds and dedicated slots kept until
+        // reset. The general title table slots can change after recording.
+        let known = crate::pipeline::host::bounded_root_srvs()
+            && !crate::descriptor::rf_x4::note_enabled()
+            && !crate::pipeline::is_builder(self.pipeline as This)
+            && !p.stages.is_empty()
+            && p.stages.iter().all(|s| {
+                let t = s.translated();
+                !t.stores_by_address
+                    && s.root_cbvs.is_empty()
+                    && t.tables.groups.is_empty()
+                    && t.host.root_indexed_views.is_empty()
+                    && t.host.root_srvs.iter().all(|&slot| !matches!(slot,
+                        victory_shader::emit::SLOT_MEMORY |
+                        victory_shader::emit::SLOT_STRIDES |
+                        victory_shader::emit::SLOT_TABLE_STRIDES))
+                    && s.shader.programs().is_some_and(|programs| {
+                        !programs.is_empty() && programs.iter().all(|program| {
+                            program.layout.iter().all(|p| p.root != RootType::ResourceHeap)
+                        })
+                    })
+            });
+        // The cache can precede bind (including a bind that fails).
+        list.keep(&p.pso);
+        self.rf_x7_roots = Some((key, known));
+        known
     }
 
     /// The stand-in for the indirect light after a dispatch of `p`
@@ -5023,6 +5077,20 @@ impl State {
     ) {
         let trace = crate::host::render_trace::DrawCall::begin(list, self.pipeline, crate::host::render_trace::Command("draw", [vertices.into(), instances.into(), first.into(), first_instance.into(), 0]));
         self.window = None;
+        if let Some(mut title) = list.rf_x7_title() {
+            // A vertex-ID/UAV draw may have no other GPU-visible inputs or
+            // outputs. Draws that need IA, targets or prep passes are opaque.
+            let known = !crate::streamline::hudless_wanted()
+                && early_budgets() == (0, 0)
+                && self.targets.is_empty()
+                && self.depth == 0
+                && self.host_targets.as_ref().is_some_and(|(color, depth)| color.is_empty() && depth.is_none())
+                && self.topology != RECTANGLES
+                && crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| {
+                    p.slots == 0 && self.rf_x7_bounded_roots(list, p)
+                });
+            title.begin(&list.list, known);
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         if crate::streamline::hudless_wanted() {
@@ -5046,6 +5114,9 @@ impl State {
             if let Some(viewport) = frontend {
                 viewports(list, &[viewport]);
             }
+            if let Some(mut title) = list.rf_x7_title() {
+                title.shader_work(&list.list);
+            }
             list.gpu_pass(false, self.pipeline, crate::host::render_trace::Command("draw", [count.into(), instances.into(), from.into(), first_instance.into(), 0]), || gpu_pass_name(self.pipeline));
             trace.recorded();
             // SAFETY: an open list with everything set.
@@ -5060,6 +5131,7 @@ impl State {
             DRAWN.add(1);
         }
         if !ran {
+            list.rf_x7_opaque();
             DROPPED.add(1);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
