@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(windows)]
 pub(crate) fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_RF_X9").is_some_and(|v| v == "1"))
+    // On by default (measured: faster while streaming, even when standing); "0" turns it off.
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RF_X9").is_none_or(|v| v != "0"))
 }
 
 #[cfg(windows)]
