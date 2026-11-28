@@ -16,6 +16,12 @@ pub(crate) fn incremental_bindless() -> bool {
 }
 
 #[cfg(windows)]
+pub(crate) fn defer_descriptor_rearm() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| enabled() && std::env::var_os("VICTORY_RF_X9_FAULTS").is_some_and(|v| v == "1"))
+}
+
+#[cfg(windows)]
 pub(crate) fn verify() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| enabled() && std::env::var_os("VICTORY_RF_X9_VERIFY").is_some_and(|v| v == "1"))
@@ -274,6 +280,13 @@ mod telemetry {
     static GPU_WRITER: AtomicU64 = AtomicU64::new(0);
     static STALE: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
     static BINDLESS_BUFFERS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    static DESCRIPTOR_REARMS_DEFERRED: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn descriptor_rearm_deferred() {
+        if stats() {
+            DESCRIPTOR_REARMS_DEFERRED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     pub(crate) fn bindless_buffers(fresh_frame: bool, slots: usize, refreshes: usize) {
         if stats() {
@@ -373,6 +386,12 @@ mod telemetry {
             "rf-x9: refreshes/frame[flushes={waves:.1} checks={checks:.1} clean={clean:.1} parallel={parallel:.1}] bindless-buffers/frame[first={frame_start:.1} later={later:.1} slots={slots:.1} refreshes={scheduled:.1}] incremental={}",
             super::incremental_bindless(),
         );
+        if super::defer_descriptor_rearm() {
+            tracing::info!(
+                "rf-x9: descriptor-rearms-deferred/frame={:.1}",
+                per_frame(&DESCRIPTOR_REARMS_DEFERRED),
+            );
+        }
     }
 }
 

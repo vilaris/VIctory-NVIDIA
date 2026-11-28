@@ -117,9 +117,13 @@ pub(crate) fn submission() -> u64 {
 }
 
 pub(crate) fn present() {
-    if settings().always_dirty {
+    if descriptor_heat() {
         FRAME.fetch_add(1, Relaxed);
     }
+}
+
+pub(crate) fn descriptor_heat() -> bool {
+    settings().always_dirty || crate::rf_x9::defer_descriptor_rearm()
 }
 
 const FIELDS: usize = 7;
@@ -178,8 +182,7 @@ pub(crate) fn timer() -> Option<Instant> {
 }
 
 pub(crate) fn fault_timer() -> Option<Instant> {
-    let settings = settings();
-    (settings.stats || settings.always_dirty).then(Instant::now)
+    (settings().stats || descriptor_heat()).then(Instant::now)
 }
 
 pub(crate) fn protected(at: usize, len: usize, start: Instant, fault: bool) {
@@ -442,6 +445,33 @@ mod tests {
         }
         assert!(!budget.take(5, || panic!("the budget is exhausted")));
         assert!(budget.take(6, || true));
+    }
+
+    #[test]
+    fn repeated_descriptor_rounds_bound_extra_reads_and_reduce_rearms() {
+        const HEAPS: usize = 4;
+        const ROUNDS: usize = 24;
+        const HOT_BLOCKS: usize = 8;
+        let mut heat: [Heat; HEAPS * HOT_BLOCKS] = Default::default();
+        for entry in &mut heat {
+            entry.fault(1, 350, &TEST);
+            entry.fault(1, 50, &TEST);
+        }
+        let mut budget = DescriptorBudget::EMPTY;
+        let mut deferred = 0;
+        let mut rearmed = 0;
+        for _ in 0..ROUNDS {
+            for entry in &heat {
+                if budget.take(2, || entry.pauses(2)) {
+                    deferred += 1;
+                } else {
+                    rearmed += 1;
+                }
+            }
+        }
+        assert_eq!(deferred * crate::watch::PAGE, 1 << 20);
+        assert_eq!(rearmed, HEAPS * ROUNDS * HOT_BLOCKS - deferred);
+        assert!(!budget.take(9, || heat[0].pauses(9)));
     }
 
     #[test]
