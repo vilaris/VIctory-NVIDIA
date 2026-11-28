@@ -1541,6 +1541,7 @@ fn open_x9(block: usize) -> bool {
     BESIDE.set(block);
     PUBLISHED.clear(block);
     bump_write_blocks(block, block + 1);
+    put_count(block).store(0, std::sync::atomic::Ordering::Relaxed);
     if !make_writable(block, true) {
         OPENING.clear(block);
         return false;

@@ -1027,6 +1027,13 @@ fn jobs_of(this: This, lists: &[This]) -> Vec<Job> {
             jobs.push(Job::Run(queue, taken, order));
         }
     }
+    if crate::rf_x9::enabled() {
+        for job in &jobs {
+            if let Job::Run(_, detached, _) = job {
+                detached.iter().for_each(|list| list.host().plan_x9_capture());
+            }
+        }
+    }
     jobs
 }
 
