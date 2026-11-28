@@ -19,10 +19,13 @@ mancha precisa de A/B, porque a captura disponível tem as duas condições.
   samplers pelo tipo de heap. Um leitor descartado dessa forma podia deixar
   tanto a lista sem bit quanto o heap fora da rodada.
 - O log `victory-nvidia-play-20261128-004001-31668.log` também tem duas falhas de
-  tradução de compute de skinning com o X4 ligado. As saídas desses produtores
-  podem afetar geometria e atributos da pele se os dispatches forem pedidos.
-  O log de tradução na carga, sozinho, não mede quantos dispatches foram
-  descartados na cena. O histórico de GI é outra variável independente.
+  tradução de compute de skinning com o X4 ligado. Os mesmos hashes falharam
+  em `victory-nvidia-play-20261127-234144-24100.log`, sem os switches do X4.
+  A falha já existia antes do X4 e pode produzir pele sem skinning atualizado,
+  com posições ou atributos velhos que afetam a iluminação dos braços.
+  O log de tradução na carga, sozinho, não confirma que a cena despachou
+  esses produtores nem que foram a causa das manchas. O histórico de GI é
+  outra variável independente.
 
 O X6 usa os bits de indexação de views e samplers do `SFI0` emitido e cobre os
 dois SRVs de strides. Heap emprestado, tabela com binding ausente e metadados
@@ -61,8 +64,9 @@ variantes que a cena pode nunca executar.
 
 | Hash | Entrada | Classe e estado |
 | --- | --- | --- |
-| `5e3dd99e0f067aee` | `CS_Emit_Dynamic_Model_AttachMesh_Skinned` | Skinning, falha no lowering wave64 → wave32. |
-| `ae0deeafe219c15c` | `CS_Emit_Dynamic_Model_Skinned` | Skinning, mesma falha. |
+| `5e3dd99e0f067aee` | `CS_Emit_Dynamic_Model_AttachMesh_Skinned` | Skinning, falha no lowering wave64 → wave32. Retry wave-wide restaurado. |
+| `ae0deeafe219c15c` | `CS_Emit_Dynamic_Model_Skinned` | Skinning, mesma falha e correção. |
+| `57f1b81de55c2842` | `CS_Emit_Dynamic_Model_EdgeHashGrid` | Grade de arestas de modelo dinâmico. Retry wave-wide restaurado pelo mesmo patch. |
 | `6b82bc7d22016cb5` | `CS_CollectTriangles_Meshlets` | Triângulos para decal. O grupo de 1.024 threads usa os 32 KiB de LDS antes dos encontros de waves. Corrigir exige outra estratégia de lowering. |
 | `926c46bab3b86bd6` | `CS_TransmissionVolumetricsSubmerged` | Luz volumétrica submersa. O digest já está na lista wave-wide de `4f49709`. A falha persistiu na captura e precisa de `VICTORY_WAVE_WHY=1` para atribuir a etapa exata. |
 | `02384a60fda6f2d0` | `CS_DefragHeap_ComputeRelocations` | Decais, exclusão por custo. O commit `672442b` registra 11,85 ms GPU por quadro. `89cfae2` reduz os encontros de waves e já está na base. |
@@ -74,13 +78,21 @@ variantes que a cena pode nunca executar.
 | `9991e29feaa26e3e`, `1580e5a72e54fcdf`, `0c028454b58543f0`, `eab96ed5d1684967` | `CS_ShadowTileClassify`, `CS_ShadowTileSimpleClear`, `CS_ShadowUnifiedClearRaster`, `CS_ShadowUnifiedClearRT` | Classificação e limpeza de sombras. A captura não fornece a contagem efetiva de argumentos por variante. |
 
 A ausência de jobs de criação na fila é compatível com falhas permanentes de
-tradução. Os dois digests de skinning estão ausentes do `scene_kernel` desta
-base. O commit `2b028ea`, fora da ancestralidade do branch, registra sucesso
-em RTX 4070 ao incluir esses digests na lista de computes de 64 threads com
-retry wave-wide. Ele também cobre `57f1b81de55c2842` (edge hash de modelo
-dinâmico) e `a10179ab7eda0dc3` (volume de portais), cujo digest já consta
-na base. Reaplicar somente os digests faltantes preserva o limite de 64
-threads e as condições do tradutor.
+tradução. O commit `2b028ea`, fora da ancestralidade do branch, registra
+sucesso em RTX 4070 ao incluir esses digests na lista de computes de 64 threads
+com retry wave-wide. O X6 reaplica somente os três digests faltantes. O digest
+de `a10179ab7eda0dc3` (volume de portais) já consta na base.
+
+| Hash do catálogo | Digest do cabeçalho DXBC conferido com `2b028ea` |
+| --- | --- |
+| `5e3dd99e0f067aee` | `b30a8c4ee58b40888561d52b15a80ae2` |
+| `ae0deeafe219c15c` | `277f659e06f02ba2685aff1d0df03f5e` |
+| `57f1b81de55c2842` | `e491942bdcb501473a9a4a00a0bd5933` |
+
+A correção muda o resultado da tradução dos dois computes de skinning em
+hosts wave32. Ambos passam pelo retry que produz DXIL, sem switch novo. O
+fingerprint das fontes do tradutor muda a chave do cache, então a próxima
+execução recompila esses shaders e pode reaquecê-lo para outros shaders.
 
 Para cascatas, o clamp compute lê a contagem da GPU. Ele pode zerar grupos
 quando a contagem excede o limite ou o orçamento do lote. A telemetria nova
@@ -136,8 +148,9 @@ Comece com `VICTORY_RF_X6_RESTORE_LEFTOUT=0`.
 | D, custo combinado | 1 | 1 | 0 | 1 |
 
 Defeito só em B aponta para a rota X4. Blocos que respondem a C com o X4
-desligado apontam para a contribuição das sondas. Confira também os descartes
-de skinning na mesma janela de B e a cor dos braços em movimento. Compare
+desligado apontam para a contribuição das sondas. Se A e B melhorarem frente
+à captura anterior, confira se os dois computes de skinning passaram a
+traduzir e se as manchas mudam com a animação. Compare
 `rf-x4 diverge`, `rf-x6:`, tempo de preparação, tempo GPU e sombras. Em
 uma passada separada, veja o custo e a imagem com
 `VICTORY_RF_X6_RESTORE_LEFTOUT=1` e `VICTORY_EARLY_DEPTH=1`.
