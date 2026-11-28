@@ -11091,6 +11091,7 @@ impl Meter {
         submit_split_line(frames, |split, flushes| self.rf_x3.sample(elapsed, frames as u64, preparing, prepare_us, split, flushes)); // rf-x3
         fresh_open_line(frames);
         crate::heap_marks::line(frames);
+        crate::pipeline::rf_x6::line(frames); // rf-x6
         #[cfg(feature = "diagnostics")]
         split_line(frames);
         {

@@ -1809,11 +1809,14 @@ impl State {
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+        let command = if mesh { "mesh dispatch" } else if indexed { "draw indexed" } else { "draw" };
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
+            crate::pipeline::rf_x6::record(self.pipeline as This, command, Some("VICTORY_SKIP_PIPELINES"));
             return false;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            crate::pipeline::rf_x6::record(self.pipeline as This, command, None);
             return false;
         };
         if p.compute || p.mesh != mesh {
@@ -1979,18 +1982,11 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
-        if crate::descriptor::rf_x4::note_enabled() { // rf-x4
-            for stage in &p.stages {
-                let t = stage.translated();
-                let missing_table = t.host.user_data.iter().filter(|u| u.root == RootType::Table).any(|u| {
-                    let Some(&Root::Table(h)) = self.roots_ref(compute).get(usize::from(u.slot)) else { return true };
-                    !self.heap_of(h).is_some_and(|heap| heap.index(h).and_then(|slot| heap.handle(slot)) == Some(h))
-                });
-                crate::descriptor::rf_x4::note_shader(list, self.heaps, &stage.shader, t, missing_table);
-            }
+        let x4 = crate::descriptor::rf_x4::note_enabled();
+        if !x4 {
+            self.early_textures(list, p, compute);
         }
-        // Textures picked by index, before anything asks for them.
-        self.early_textures(list, p, compute);
+        let mut lent = false;
         if crate::host::walls_trace() {
             self.walls_census(p, compute);
         }
@@ -2003,7 +1999,20 @@ impl State {
             once!("a dispatch without a view heap that needs one gets the title's");
             list.note_heap_picked();
             self.heaps[0] = heap;
-            crate::descriptor::rf_x4::note_lent(list, self.heaps); // rf-x4
+            lent = true;
+        }
+        if x4 {
+            for stage in &p.stages {
+                let t = stage.translated();
+                let missing_table = t.host.user_data.iter().filter(|u| u.root == RootType::Table).any(|u| {
+                    let Some(&Root::Table(h)) = self.roots_ref(compute).get(usize::from(u.slot)) else { return true };
+                    !self.heap_of(h).is_some_and(|heap| heap.index(h).and_then(|slot| heap.handle(slot)) == Some(h))
+                });
+                crate::descriptor::rf_x4::note_shader(
+                    list, self.heaps, &stage.shader, t, p, self.pipeline as This, lent || missing_table,
+                );
+            }
+            self.early_textures(list, p, compute);
         }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them, with both a view heap and a sampler heap bound.
@@ -2082,7 +2091,7 @@ impl State {
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
-            let made = self.tables(list, &t.tables, compute);
+            let made = self.tables(list, &t.tables, compute, &stage.shader);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -2525,6 +2534,7 @@ impl State {
         // shortcut: what the title writes into such buffers between lists
         // of one frame is seen a frame late.
         let frame = crate::frame::current();
+        heap.sync_before_heap_pass(frame, crate::descriptor::HeapPass::Buffers);
         if host.buffer_frame.swap(frame, Ordering::Relaxed) == frame {
             return Some(gpu);
         }
@@ -2964,6 +2974,7 @@ impl State {
         let Some(host) = heap.host() else {
             return;
         };
+        heap.sync_before_heap_pass(frame, crate::descriptor::HeapPass::EarlyTextures);
         if is_bake {
             let began = std::time::Instant::now();
             let mut bake_slot = BAKE_UPLOAD.lock().unwrap_or_else(|e| e.into_inner());
@@ -3861,12 +3872,14 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.add(1);
+            crate::pipeline::rf_x6::record(self.pipeline as This, "dispatch", Some("VICTORY_SKIP_PIPELINES"));
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             DROPPED.add(1);
+            crate::pipeline::rf_x6::record(self.pipeline as This, "dispatch", Some("ray-tracing builder disabled or unavailable"));
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
@@ -3875,6 +3888,7 @@ impl State {
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            crate::pipeline::rf_x6::record(self.pipeline as This, "dispatch", None);
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
@@ -4619,7 +4633,7 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
+    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool, shader: &crate::pipeline::Shader) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -4630,6 +4644,7 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
+        heap.note_verify_table(index, shader, self.pipeline as This);
         if let Some(view) = host.mirror(index, handle, true) {
             readable(list, u.kind, &view);
             // Up to date by this draw: not the texture pass's to make.
@@ -4654,11 +4669,12 @@ impl State {
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
-    pub(crate) fn tables(
+    fn tables(
         &mut self,
         list: &HostList,
         plan: &TablePlan,
         compute: bool,
+        shader: &crate::pipeline::Shader,
     ) -> Few<(u8, u32), 16> {
         let mut fresh = [0u64; 4];
         let selected_slot = |mask: &[u64; 4], slot: u8| mask[usize::from(slot / 64)] & (1u64 << (slot % 64)) != 0;
@@ -4679,7 +4695,7 @@ impl State {
         for &(g, e) in &plan.direct {
             let group = &plan.groups[g];
             if !selected_slot(&fresh, group.slot) {
-                self.table_entry(list, &group.entries[e], compute);
+                self.table_entry(list, &group.entries[e], compute, shader);
             }
         }
         let mut made = Few::default();
@@ -5332,21 +5348,26 @@ impl State {
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
+            crate::pipeline::rf_x6::record(self.pipeline as This, "indirect", Some("VICTORY_SKIP_PIPELINES"));
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            crate::pipeline::rf_x6::record(self.pipeline as This, "indirect", Some("ray-tracing builder disabled or unavailable"));
             return false;
         }
         const DRAW: u32 = 0;
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
-        #[cfg(feature = "diagnostics")]
-        let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
-        #[cfg(not(feature = "diagnostics"))]
-        let why = |_: &str| {};
+        let pipeline = self.pipeline as This;
+        let why = |what: &'static str| {
+            crate::pipeline::rf_x6::record(pipeline, "indirect", Some(what));
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
+        };
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            crate::pipeline::rf_x6::record(self.pipeline as This, "indirect", None);
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
@@ -5375,10 +5396,7 @@ impl State {
             _ => false,
         };
         if !matches_kind {
-            why(&format!(
-                "pipeline mismatch (compute {}, mesh {}, topology {})",
-                p.compute, p.mesh, self.topology
-            ));
+            why("pipeline kind or topology mismatch");
             return false;
         }
         let len = u64::from(stride) * u64::from(max.max(1));
@@ -5617,7 +5635,9 @@ impl State {
         // the run before: the tables noted are another program's.)
         if kind == DISPATCH
             && !joined
-            && let Some(role @ crate::ambient::Role::Miss) = p.stages.first().and_then(|s| s.shader.ambient)
+            && let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
+            && (role == crate::ambient::Role::Miss
+                || role == crate::ambient::Role::Resolve && crate::ambient::rt_fallback())
             && crate::ambient::on()
         {
             unsettle_indirect(list);
@@ -5635,6 +5655,9 @@ impl State {
             DRAWN.add(1);
         }
         trace.recorded();
+        if kind == DISPATCH {
+            crate::pipeline::rf_x6::shadow(self.pipeline as This, "accepted (dispatch groups determined on GPU)");
+        }
         true
     }
 }

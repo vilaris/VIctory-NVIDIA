@@ -97,7 +97,11 @@ fn water_light_left_out(shaders: &[Arc<Shader>]) -> bool {
 }
 
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
-    if !leave_out().is_empty() && shaders.iter().any(|s| leave_out().contains(&s.hash)) {
+    if !leave_out().is_empty()
+        && shaders.iter().any(|s| {
+            leave_out().contains(&s.hash) && !super::rf_x6::restore_left_out(&s.hash)
+        })
+    {
         return Some("named in VICTORY_LEAVE_OUT, left out");
     }
     if water_light_left_out(shaders) {
@@ -183,6 +187,20 @@ impl Pending {
 
     pub(super) fn key(&self) -> &str {
         &self.key
+    }
+
+    pub(super) fn drop_reason(&self) -> &'static str {
+        if let Some(why) = self.left_out {
+            return why;
+        }
+        match self.made.get() {
+            None => "host pipeline pending",
+            Some(Some(_)) => "host pipeline became ready after lookup",
+            Some(None) if self.shaders.iter().any(|s| matches!(s.translated.get(), Some(None))) => {
+                "shader translation failed"
+            }
+            Some(None) => "host pipeline creation refused",
+        }
     }
 
     fn make(&self) {
