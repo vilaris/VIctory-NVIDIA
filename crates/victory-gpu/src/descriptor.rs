@@ -630,7 +630,11 @@ pub(crate) fn sync_heaps() {
         } else {
             end as usize
         };
-        let taken = written.take(start as usize, watched_end);
+        let taken = if x4_blocks {
+            written.take_descriptors(watched_end, mirrored_end)
+        } else {
+            written.take(start as usize, watched_end)
+        };
         let asking = since(began);
         spent[0] += asking;
         // (E4) the asking, split by whether it found anything.
