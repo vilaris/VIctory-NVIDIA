@@ -261,13 +261,26 @@ impl Table {
 /// which is in state `before` and left in `INDIRECT_ARGUMENT`: after every
 /// earlier shader write (the title's argument passes), before what reads
 /// the clamped records.
+#[cfg(test)]
 pub(super) fn record(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    dst: (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    budget: u64,
+    sources: [u64; SOURCES],
+    jobs: u64,
+) {
+    record_scoped(c, l, dst, budget, sources, jobs, None);
+}
+
+pub(super) fn record_scoped(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
     (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
     budget: u64,
     sources: [u64; SOURCES],
     jobs: u64,
+    scope: Option<crate::rf_x7::ClampScope<'_>>,
 ) {
     let after = transition(
         dst,
@@ -278,10 +291,10 @@ pub(super) fn record(
     // the sources and the table are read in the common state (promoted).
     unsafe {
         let _rf_x2 = crate::rf_x2::range(l, "vx:indirect.clamp.batch"); // rf-x2
-        crate::rf_x2::barriers(l, "vx:barrier.indirect", &[ // rf-x2
+        crate::rf_x7::victory_barriers(l, "vx:barrier.indirect", &[
             uav_barrier(),
             transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-        ]);
+        ], scope);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         for (i, source) in sources.into_iter().enumerate() {
@@ -290,6 +303,7 @@ pub(super) fn record(
         l.SetComputeRootShaderResourceView(SOURCES as u32, jobs);
         l.SetComputeRootUnorderedAccessView(SOURCES as u32 + 1, dst.GetGPUVirtualAddress());
         l.SetComputeRootUnorderedAccessView(SOURCES as u32 + 2, budget);
+        crate::rf_x7::work(l, Some(true));
         l.Dispatch(JOBS.div_ceil(64), 1, 1);
         // Nothing else the pass writes is read before the next full wait
         // (the budget, by the next pass): only the records have to be there.

@@ -425,7 +425,7 @@ pub(crate) fn bound_ahead(
     clamp_into(list, c, &dst, budget, src, None, spec, true).then_some(dst)
 }
 
-/// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
+/// [`record_clamp`] into `list`'s scratch buffer `dst`, from the state
 /// the list left it in; afterwards the list knows it is readable as
 /// indirect arguments.
 #[allow(clippy::too_many_arguments)]
@@ -441,7 +441,8 @@ fn clamp_into(
 ) -> bool {
     let before = list.indirect_state(dst);
     list.trace_gpu_pass("indirect argument clamp", [spec.0.into(), spec.1.into(), spec.2.into(), i64::from(ahead), 0]);
-    let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, ahead);
+    let scope = crate::rf_x7::narrow().then(|| list.rf_x7_budget()).flatten();
+    let recorded = record_clamp(c, &list.list, (dst, before), (budget, scope), src, count, spec, ahead);
     if recorded {
         list.indirect_readable(dst);
     }
@@ -454,11 +455,26 @@ fn clamp_into(
 /// their draws ([`bound_ahead`]). False, with nothing recorded, if the
 /// layout or the addresses do not fit the clamp.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn record_clamp_as(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
     (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
     budget: u64,
+    (src, src_offset): (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    (kind, stride, records): (u32, u32, u32),
+    ahead: bool,
+) -> bool {
+    record_clamp(c, l, (dst, before), (budget, None), src, count, (kind, stride, records), ahead)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_clamp(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    (budget, budget_buffer): (u64, Option<&ID3D12Resource>),
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
@@ -525,20 +541,24 @@ fn record_clamp_as(
     let first = [
         uav_barrier(),
         transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+        // Used only when no dispatch separates the two transitions.
+        transition(dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
     ];
     // The state transition on `dst` already orders UAV writes to `dst` before
     // `ExecuteIndirect` reads it; `budget` is only read/written by the next
     // clamp/batch pass, which begins with `first[0]` (`uav_barrier()`).
-    let after = transition(
-        dst,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-    );
     let skip = usize::from(!waits);
+    let inputs = [src, count.map_or(src, |(buf, _)| buf)];
+    let scope = budget_buffer.filter(|_| records > 0).map(|budget| crate::rf_x7::ClampScope {
+        inputs: &inputs,
+        budget,
+    });
+    let empty = records == 0 && crate::rf_x7::narrow();
     unsafe {
         let _rf_x2 = crate::rf_x2::range(l, "vx:indirect.clamp"); // rf-x2
         // Earlier shader writes (the title's argument and count passes) first.
-        crate::rf_x2::barriers(l, "vx:barrier.indirect", &first[skip..]); // rf-x2
+        let end = if empty { 3 } else { 2 };
+        crate::rf_x7::victory_barriers(l, "vx:barrier.indirect", &first[skip..end], scope);
         if records > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
@@ -547,9 +567,12 @@ fn record_clamp_as(
             l.SetComputeRootShaderResourceView(2, count_gpu);
             l.SetComputeRootUnorderedAccessView(3, dst_gpu);
             l.SetComputeRootUnorderedAccessView(4, budget);
+            crate::rf_x7::work(l, Some(true));
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        crate::rf_x2::barriers(l, "vx:barrier.indirect", &[after]); // rf-x2
+        if !empty {
+            crate::rf_x2::barriers(l, "vx:barrier.indirect", &first[2..]); // rf-x2
+        }
     }
     true
 }
@@ -593,6 +616,7 @@ pub(crate) fn open_batch(
     // A source there is none of is the first again, which no job names.
     let mut ids = [0u64; batch::SOURCES];
     let mut sources = [gpu(source.1)?; batch::SOURCES];
+    let mut source_buffers = [source.1; batch::SOURCES];
     ids[0] = source.0;
     let others = recent.iter().filter(|r| r.0 != source.0).take(batch::SOURCES - 1);
     for (i, (id, buffer)) in others.enumerate() {
@@ -601,12 +625,16 @@ pub(crate) fn open_batch(
             // copies draws read (`Shadow::refresh`).
             list.keep(buffer);
             (ids[i + 1], sources[i + 1]) = (*id, at);
+            source_buffers[i + 1] = buffer;
         }
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
     list.trace_gpu_pass("indirect argument clamp batch", [0; 5]);
-    batch::record(c, &list.list, (&dst, before), budget, sources, jobs);
+    let scope = crate::rf_x7::narrow().then(|| list.rf_x7_budget()).flatten().map(|budget| {
+        crate::rf_x7::ClampScope { inputs: &source_buffers, budget }
+    });
+    batch::record_scoped(c, &list.list, (&dst, before), budget, sources, jobs, scope);
     // SAFETY: the list's own upload memory of that many bytes, 256-byte
     // aligned, until it is reset.
     Some((unsafe { batch::Table::new(at, base, ids) }, dst))

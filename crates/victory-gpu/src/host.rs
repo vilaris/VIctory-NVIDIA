@@ -1426,6 +1426,7 @@ pub(crate) struct HostList {
     allocator: Mutex<(ID3D12CommandAllocator, u64)>,
     pub(crate) list: ID3D12GraphicsCommandList,
     pub(crate) rf_x2: Option<Box<crate::rf_x2::Recording>>, // rf-x2
+    rf_x7: Option<Box<Mutex<crate::rf_x7::Title>>>, // rf-x7
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -1523,6 +1524,7 @@ static PRELUDES: Mutex<Vec<(Prelude, u64)>> = Mutex::new(Vec::new());
 
 impl Drop for HostList {
     fn drop(&mut self) {
+        crate::rf_x7::close(&self.list);
         if self.prelude.get_mut().unwrap_or_else(|e| e.into_inner()).is_some() {
             PRELUDES_ALIVE.fetch_sub(1, Ordering::Relaxed);
         }
@@ -5185,12 +5187,14 @@ impl Host {
             }
             // (made open: it is recorded from here on)
             let rf_x2 = crate::rf_x2::Recording::new(&list, origin); // rf-x2
+            crate::rf_x7::open(&list); // rf-x7
             let gpu_time = gpu_time::List::default();
             gpu_time.start(&list);
             Ok(HostList {
                 allocator: Mutex::new((allocator, now_ms())),
                 list,
                 rf_x2, // rf-x2
+                rf_x7: crate::rf_x7::tracking().then(|| Box::new(Mutex::default())), // rf-x7
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
@@ -7684,11 +7688,23 @@ impl Host {
 }
 
 impl HostList {
+    pub(crate) fn rf_x7_title(&self) -> Option<std::sync::MutexGuard<'_, crate::rf_x7::Title>> {
+        self.rf_x7.as_ref().map(|title| title.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Unknown GPU work or a physical list boundary ends the tracked interval.
+    pub(crate) fn rf_x7_opaque(&self) {
+        if let Some(mut title) = self.rf_x7_title() {
+            title.opaque(&self.list);
+        }
+    }
+
     /// The draws and dispatches recorded next: a new GPU pass where the
     /// work's key changes ([`gpu_time`]): draws keep one until the render
     /// targets change ([`Self::gpu_pass_break`]), each compute pipeline's
     /// run of dispatches is one. `name` is asked only for a new pass.
     pub(crate) fn gpu_pass(&self, compute: bool, pipeline: usize, command: render_trace::Command, name: impl FnOnce() -> String) {
+        crate::rf_x7::work(&self.list, Some(compute)); // rf-x7
         crate::rf_x2::title_work(self); // rf-x2
         self.gpu_time.work();
         let (key, kind) = if compute { (pipeline as u64 | 1, gpu_time::COMPUTE) } else { (2, gpu_time::DRAW) };
@@ -7722,6 +7738,7 @@ impl HostList {
     /// barrier is work ([`Self::gpu_work`]).
     pub(crate) fn gpu_step(&self, kind: gpu_time::Step, bytes: u64) {
         if !matches!(kind, gpu_time::Step::Transitions | gpu_time::Step::ShaderWrites) {
+            crate::rf_x7::work(&self.list, None); // rf-x7
             self.gpu_time.work();
         }
         if matches!(kind, gpu_time::Step::BufferCopies | gpu_time::Step::TextureCopies | gpu_time::Step::MemoryCopies) {
@@ -7836,6 +7853,7 @@ impl HostList {
         let _closing = crate::timeline::span("closing a host list");
         self.left_open[0].store(0, Ordering::Release);
         self.flush_indirect();
+        self.rf_x7_opaque(); // rf-x7
         if self.twins.lock().unwrap_or_else(|e| e.into_inner()).values().any(|u| u.behind[0] == Some(true) || u.late) {
             self.gpu_pass_ours(1, "ours: depth twins at the list's end");
             self.twins_to_depth();
@@ -7845,15 +7863,22 @@ impl HostList {
             self.textures_back();
         }
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if let Some((scratch, _)) = scratch
-            && self.deferred().indirect_readable == scratch.as_raw() as usize
-        {
-            self.gpu_pass_ours(3, "ours: indirect argument clamps");
-            self.indirect_common(&scratch);
-        }
-        if self.batch_args.lock().unwrap_or_else(|e| e.into_inner()).1 > 0 {
+        let batches = self.batch_args.lock().unwrap_or_else(|e| e.into_inner()).1 > 0;
+        if batches && crate::rf_x7::narrow() {
+            let single = scratch.as_ref().and_then(|(scratch, _)| self.take_indirect_common(scratch));
             self.gpu_pass_ours(4, "ours: indirect argument clamps in batches");
-            self.batches_common();
+            self.batches_common(single);
+        } else {
+            if let Some((scratch, _)) = scratch
+                && self.deferred().indirect_readable == scratch.as_raw() as usize
+            {
+                self.gpu_pass_ours(3, "ours: indirect argument clamps");
+                self.indirect_common(&scratch);
+            }
+            if batches {
+                self.gpu_pass_ours(4, "ours: indirect argument clamps in batches");
+                self.batches_common(None);
+            }
         }
         self.card_budget_out();
         self.take_coming();
@@ -7870,6 +7895,7 @@ impl HostList {
         }
         // SAFETY: our list.
         crate::rf_x2::Recording::close(self.rf_x2.as_deref(), &self.list); // rf-x2
+        crate::rf_x7::close(&self.list); // rf-x7
         if let Err(e) = unsafe { self.list.Close() } {
             fail(format_args!(
                 "a host command list did not close ({e}): a command recorded into it was invalid"
@@ -7974,6 +8000,10 @@ impl HostList {
     pub(crate) fn reset(&self) {
         // Before the epoch moves on below.
         let left_open = self.still_left_open();
+        if let Some(mut title) = self.rf_x7_title() {
+            *title = crate::rf_x7::Title::default();
+        }
+        crate::rf_x7::open(&self.list); // rf-x7
         self.changed_something();
         self.holding.store(false, Ordering::Relaxed);
         *self.indirect_run.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -8096,11 +8126,13 @@ impl HostList {
             && let Some(held) = held.take()
         {
             self.holding.store(false, Ordering::Relaxed);
+            self.rf_x7_opaque(); // rf-x7
             // (an indirect execution: shader work)
             if render_trace::active() {
                 self.gpu_pass(run.kind == 2, run.pipeline, render_trace::Command("execute_indirect_merged", [run.kind.into(), run.records.into(), run.at as i64, 0, run.step.into()]), || format!("indirect pipeline {:#x}", run.pipeline));
             } else {
                 crate::rf_x2::title_work(self); // rf-x2
+                crate::rf_x7::work(&self.list, Some(run.kind == 2)); // rf-x7
                 self.gpu_time.work();
             }
             held.record(&self.list, run);
@@ -8490,6 +8522,11 @@ impl HostList {
         }));
         if barriers.is_empty() && syncs.is_empty() && uploads.is_empty() {
             return None;
+        }
+        if crate::rf_x7::narrow() && !aliasing.is_empty() {
+            // Consecutive barriers: alias first, then transition to the
+            // copy states, in the same order the separate calls used.
+            aliasing.append(&mut to_copy);
         }
         let mut held = self.prelude.lock().unwrap_or_else(|e| e.into_inner());
         if held.is_none() {
@@ -8922,6 +8959,15 @@ impl HostList {
         Some(unsafe { card.map_or_else(|| buffer.GetGPUVirtualAddress() + offset, |card| card.GetGPUVirtualAddress()) })
     }
 
+    /// The resource behind the address returned by `budget`, including when
+    /// the budget occupies one slot in a mapped slab.
+    pub(crate) fn rf_x7_budget(&self) -> Option<&ID3D12Resource> {
+        match self.card_budget.get() {
+            Some(Some(card)) => Some(card),
+            _ => self.budget.get()?.as_ref().map(|budget| budget.place().0),
+        }
+    }
+
     /// The budget's words in the card's own memory ([`card_budget`]), if
     /// the list can zero them itself (`WriteBufferImmediate`).
     fn make_card_budget(&self) -> Option<ID3D12Resource> {
@@ -9046,12 +9092,13 @@ impl HostList {
 
     /// Before the list closes: the scratch buffers of the batched clamps go
     /// back to the common state, where the next recording expects them.
-    fn batches_common(&self) {
+    fn batches_common(&self, first: Option<D3D12_RESOURCE_BARRIER>) {
         let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
         let used = std::mem::take(&mut args.1).div_ceil(BATCHES) as usize;
-        let barriers: Vec<D3D12_RESOURCE_BARRIER> = args.0[..used]
-            .iter()
-            .map(|b| transition(b, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON))
+        let barriers: Vec<D3D12_RESOURCE_BARRIER> = first.into_iter()
+            .chain(args.0[..used].iter().map(|b| {
+                transition(b, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON)
+            }))
             .collect();
         if !barriers.is_empty() {
             // SAFETY: an open list and live buffers this recording left in
@@ -9067,21 +9114,24 @@ impl HostList {
     /// there was one per indirect execution), and the list ends as it
     /// begins however it is submitted.
     fn indirect_common(&self, scratch: &ID3D12Resource) {
-        {
-            let mut deferred = self.deferred();
-            if deferred.indirect_readable != scratch.as_raw() as usize {
-                return;
-            }
-            deferred.indirect_readable = 0;
+        if let Some(barrier) = self.take_indirect_common(scratch) {
+            // SAFETY: an open list and a live buffer this recording left in
+            // `INDIRECT_ARGUMENT`.
+            unsafe { crate::rf_x2::barriers(&self.list, "vx:barrier.indirect", &[barrier]) }; // rf-x2
         }
-        let barrier = transition(
+    }
+
+    fn take_indirect_common(&self, scratch: &ID3D12Resource) -> Option<D3D12_RESOURCE_BARRIER> {
+        let mut deferred = self.deferred();
+        if deferred.indirect_readable != scratch.as_raw() as usize {
+            return None;
+        }
+        deferred.indirect_readable = 0;
+        Some(transition(
             scratch,
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
             D3D12_RESOURCE_STATE_COMMON,
-        );
-        // SAFETY: an open list and a live buffer this recording left in
-        // `INDIRECT_ARGUMENT`.
-        unsafe { crate::rf_x2::barriers(&self.list, "vx:barrier.indirect", &[barrier]) }; // rf-x2
+        ))
     }
 
     /// The state the list's indirect scratch buffer `scratch` is in at this

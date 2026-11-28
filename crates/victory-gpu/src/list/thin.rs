@@ -741,6 +741,8 @@ extern "system" fn copy_texture_region_x(
 
 /// Makes the calls of a stream on `list`: how many, and whether the last one
 /// closed it. Once `left` says so only what must not be lost is done.
+/// RF X7 observes the lowered calls below, where GPU bindings and waits
+/// are known. CLOSE/RESET delimit the same physical lists as eager recording.
 fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
     let (mut i, mut calls, mut closed) = (0, 0, false);
     let mut skip = left();
