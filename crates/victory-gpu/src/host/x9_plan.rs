@@ -31,9 +31,9 @@ impl Recording {
 
     pub(super) fn plan(&self) {
         let Self::Shared(recording) = self else { return };
-        let Some(worker) = worker() else { return };
         let mut deferred = recording.lock().unwrap_or_else(|e| e.into_inner());
-        if deferred.x9_plan.is_some() {
+        // For small lists the inline walk is cheaper than publishing a job.
+        if deferred.x9_plan.is_some() || deferred.copies.len() < 128 {
             return;
         }
         let ticket = Ticket::default();
@@ -41,7 +41,9 @@ impl Recording {
         drop(deferred);
         // A full queue keeps the ordinary inline planner. Never stall a
         // title submit while doing speculative planning.
-        let _ = worker.try_send(Job { recording: Arc::downgrade(recording), ticket });
+        if let Some(worker) = worker() {
+            let _ = worker.try_send(Job { recording: Arc::downgrade(recording), ticket });
+        }
     }
 }
 

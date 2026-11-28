@@ -1,17 +1,20 @@
 # X9 · Coerência de memória e submissão
 
-O branch parte de `399ebd4`. O X9 entrega um caminho opt-in para abertura de guardas por bitmap, refresh por intervalos, preparação paralela de uploads e comparação de descritores. O backend completo continua pendente. Em particular, a faixa de 174 MB continua compartilhada entre CPU e GPU, as views bindless ainda têm esperas durante a tradução e o lock de submissão continua serializando a preparação. O alvo de 33 ms permanece sem medição.
+O branch parte de `399ebd4`. O X9 entrega abertura de guardas por bitmap, refresh por intervalos, um planificador para listas já destacadas, preparação paralela de uploads, descoberta de buffers bindless na submissão e envio de faixas CPU-stream sem comparar bytes. O backend completo continua pendente. A faixa mista de 174 MB conserva compare e merge onde um UAV pode escrever. A descoberta de texturas bindless ainda espera na tradução. O lock de submissão serializa as fases que alteram o estado de coerência. O alvo de 33 ms permanece sem validação.
 
 As referências de desempenho do coordenador são cerca de 45 ms de preparação olhando para uma parede (17,5 ms e 37 MB em cópias) e 93,5 ms dirigindo (50 ms e 85 MB em cópias, mais 19 ms e 259 MB em texturas). Os dois cenários exercitam custos diferentes. Até a fase de staging, as mudanças atuam nos dois eixos, usando os mesmos recursos e comandos da GPU.
+
+No build integrado `0619774` com o X9 inicial, a cena cheia ficou em 16,3–17,6 FPS e aproximadamente 53 ms na thread de submissão. Olhando para a parede, a preparação levou 45–48 ms e o jogo ficou em 18,9–19,7 FPS. O `flights` então publicado pelo X9 somava o merge de bytes com a espera inicial de dependências. A linha X5 e `putting the title's bytes under flights' writes` representam só a segunda etapa de preparação, depois da espera inicial. A nova telemetria distingue `flights` de `flight-prereq`. O resultado agregado de `0619774` não separa quanto do aumento veio de merge ou de espera.
 
 ## Fluxo implementado
 
 ```text
 ExecuteCommandLists do título
   -> queue::behind se houver relay e cortes
-  -> espera da fila do título resolvida, na ordem da fila
+       -> planejar índices de listas destacadas numa fila CPU limitada
+       -> espera da fila do título resolvida, na ordem da fila
   -> Host::submit
-       -> iniciar rodada de heaps em paralelo, quando assíncrona
+       -> resolver buffers bindless e inserir refreshes em suas posições originais
        -> dependências de flights e consulta ao watch
        -> planejar intervalos e lançar refreshes elegíveis no pool
        -> executar passos CPU ordenados e montar listas
@@ -26,6 +29,8 @@ ExecuteCommandLists do título
 ```
 
 A fila mantém a ordenação por fila do título, incluindo cortes, esperas de outras filas e sinais. A captura usa a fila limitada existente. N+1 pode ser preparada enquanto N executa na GPU se as dependências de flights permitirem. O lock de submissão serializa a preparação. O patch reaproveita pools e filas existentes e não registra novas barreiras.
+
+O planificador CPU pode indexar as listas de N+1 antes de N ser enviada. Os índices representam etapas de coerência e declarações de escrita em listas já destacadas. O planificador não lê memória do título e seu resultado vale para um único ciclo de gravação. Se uma lista for reciclada, o resultado antigo perde o vínculo com o novo ciclo. Fila cheia ou plano ainda pendente recebe a varredura inline. A descoberta bindless invalida qualquer plano de índices que ela expandir. O assembler de prelúdios, as esperas e o envio usam o agendador anterior.
 
 O pool recebe uma cópia ou grupo de cópias por job. Cada job processa os intervalos de uma cópia em série. A lista só consome a cobertura após o join. `Batch::title_written` termina o trabalho pendente e limpa a cobertura de buffers e texturas. Uma declaração GPU conserva o envelope do legado. A consulta antecipada ao watch e o teste de interseções com flights usam envelopes conservadores. A transferência pode usar a união das faixas explícitas em buffers host mapeados sem declarações ou flights de escrita e em submissões sem leitor bindless identificado.
 
@@ -49,10 +54,10 @@ O caminho de empacotamento reúne três fases CPU numa onda. A gravação dos co
 
 | Classe | Escritor e observação | Entrega dos bytes e transições |
 | --- | --- | --- |
-| CPU-stream | O título escreve os dados que `Fill` lê por extensão explícita. Para buffers privados com write-watch, o kernel indica as partes escritas de 4 KiB. | O scratch de constantes continua ligado à lista. Para envios de buffers carded, o X9 reserva uma fatia contígua e alinhada no ring de upload de 32 MiB e a mantém até `Host::card_done`. Uma fatia aposentada fora de ordem só libera espaço quando todas as fatias anteriores também estão aposentadas. Falta de espaço ou alocação usa o pool existente. Uma declaração GPU tira o buffer do planejamento estreito. |
+| CPU-stream | O título escreve os dados que `Fill` lê por extensão explícita. Para buffers privados com write-watch, o kernel indica as partes escritas de 4 KiB. Um trecho de refresh com observação pelo write-watch e sem um escritor GPU alcançável pode ser copiado diretamente para o staging do shadow, sem `word_runs`. | A informação de escritor é publicada ao criar a UAV tipada e sua versão raw, e ao declarar uma escrita ou ligar a UAV raiz gravável. Essas faixas são cumulativas durante a vida do shadow, pois listas gravadas podem reutilizar views. Um refresh que intercepta essas faixas conserva compare e merge. Os stamps e a ordenação dos envios são os mesmos para ambas as rotas. O scratch de constantes continua ligado à lista. Envios carded usam uma fatia do ring de upload de 32 MiB até `Host::card_done` e recorrem ao pool anterior se preciso. |
 | CPU-static | O título ou o runtime pode reescrever os dados. As views de seção usam guardas ou notificações de escrita. | Os bytes novos seguem nos uploads existentes antes dos leitores. Buffers carded conservam staging e VRAM. Um remap invalida as observações. Uma abertura por fault, por si só, não prova que um trecho pode ser promovido a CPU-stream sem guarda. |
 | GPU-own, pendente | Uma declaração UAV pode cobrir uma view muito maior que as escritas reais. O buffer de aproximadamente 174 MB mistura constantes do título, geometria e saída de skinning. | A comparação e o merge existentes determinam o que a GPU escreveu. `demand` ainda pode estacionar alguns trechos na VRAM. Remover staging e comparações exige delimitar quais escritas chegam ao intervalo e garantir que acessos da CPU aguardem a versão correta. |
-| Descritores | O título escreve por API, por bytes ou por passos CPU da submissão. O espelho consome páginas alteradas do cursor `Tracked`. A comparação agrupa registros por blocos e recoloca leituras incompletas na rodada seguinte. | A publicação passa por `mirror` e `make_waiting`, que resolvem a identidade e a prontidão da textura. Samplers com indexação direta dispensam a espera inicial de `note_indexed`, pois não têm uma passagem de descoberta de recursos antes da gravação. As views mantêm essas esperas onde necessárias. Uma rodada pendente pode atender várias solicitações que chegaram antes de seu início. |
+| Descritores | O título escreve por API, por bytes ou por passos CPU da submissão. O espelho consome páginas alteradas do cursor `Tracked`. A comparação agrupa registros por blocos e recoloca leituras incompletas na rodada seguinte. | A publicação passa por `mirror` e `make_waiting`. Samplers com indexação direta dispensam a espera inicial de `note_indexed`. A lista retém a referência guest dos heaps com buffers bindless. Uma rodada após as esperas da fila alimenta a descoberta dos buffers e o planejamento junto com os outros refreshes. O host varre na primeira submissão do quadro e quando novos slots de buffer estão pendentes. `early_textures`, bakes e descoberta de texturas continuam na tradução. |
 
 **DirectStorage e remap.** As notificações do xmem propagam escritas por alias ao watch e invalidam descritores dependentes do mapeamento. Para aberturas por bitmap, um remap fecha a entrada atômica, espera as aberturas em curso e muda as views. A abertura fixa o mapeamento somente com a entrada aberta. Views aliased, materialização e conflitos de proteção usam o tratamento existente.
 
@@ -77,15 +82,18 @@ A abertura elegível evita `GUARDS`, a fila `OPENED` e alocação de metadados d
 ## Telemetria e verificação
 
 - `VICTORY_RF_X9_STATS=1` emite `rf-x9:` na janela do medidor de FPS, em torno de cinco segundos. `submit-ms` é tempo de parede por quadro. `refresh` está dentro de `steps`. `jobs` soma chamadas que podem rodar no pool ou na thread chamadora. `upload-pack`, `texture` e `fill` detalham trabalho das ondas. Captura inclui backpressure. `record-heap-wait` mede chamadas que iniciam ou aguardam a rodada durante a gravação.
+- `flights` corresponde ao custo de bytes sob flights na linha X5. `flight-prereq` mede a espera inicial. `merge` mede `stale_of`, incluindo rechecagens, e `settle-and-recheck` inclui eventuais rechecagens internas. Esses valores podem se sobrepor. `merge-fallbacks` conta casos em que a consulta, a referência ou o orçamento de runs exigiram settle. X9 usa um snapshot dos stamps de 4 KiB do journal para as comparações que precisam deles, e percorre só páginas escritas quando a faixa inteira já foi inicializada. A solicitação antecipada de descritores e o refresh adiantado usam novamente os switches anteriores em vez de serem ligados automaticamente pelo X9.
+- `planning` mede a construção dos índices CPU e `heap-discovery` mede a resolução dos buffers. O custo da resolução integra o total da linha `preparing per frame, the submitting thread`, inclusive quando é preciso resolver antes de dividir a submissão.
 - Os bytes de refresh são agrupados por evidência de write-watch, guarda e memória sem tracking. `card-up` e `gpu-down` medem payload das operações da VRAM. `upload-ring` mede bytes reservados, incluindo o material de scatter e seu alinhamento. `texture-read` conta bytes de leitura na preparação de texturas. Refresh e upload da VRAM podem contabilizar os mesmos bytes em etapas diferentes. `gaps-excluded` mede lacunas excluídas do intervalo, inclusive bytes que o legado poderia reconhecer como limpos. `watch` contabiliza mudanças no mecanismo de observação do shadow. `parked-eager` conta novos blocos preferidos para landing imediato.
 - `VICTORY_RF_X9_VERIFY=1` com X9 ativo compara prefixos de até 64 bytes de fills e de intervalos elegíveis com uma leitura pelo endereço do título. Também compara a origem de DMA de um envio direto por shadow com os bytes correspondentes do shadow legado. O verificador dos descritores usa um cursor legado independente e observa a chave publicada. `rf-x9 diverge` informa a faixa e a classe. A comparação após o scatter, dos bytes finais em VRAM, de GPU-own e de texback continua pendente.
 
 ## Limites de fidelidade e desempenho
 
 - As declarações UAV de raiz e por indexação podem cobrir mais bytes que os shaders escrevem. Tratar a declaração inteira como propriedade exclusiva da GPU descartaria escritas válidas da CPU. O backend mantém a autoridade compartilhada, os hashes e o merge nessas faixas. Uma migração completa exige registrar a cobertura efetiva dos produtores, tomar posse antes do primeiro leitor da CPU e resolver remaps e aliases de DirectStorage enquanto a proteção é válida.
-- As passagens `heap_buffers` e `early_textures` leem o espelho para descobrir trabalho de buffers e texturas a registrar. Tirar a espera mantendo essas passagens na tradução pode omitir o upload ou refresh do recurso que um shader bindless usa, inclusive nos bakes. A migração das views requer planejar a descoberta e produzir os uploads antes do consumidor na submissão. `make_waiting` sozinho faz a publicação dos slots prontos.
+- A descoberta de buffers em `heap_buffers` vai para a submissão, mas o upload de texturas que o método agenda e as passagens de `early_textures` e de bake continuam na gravação. A migração do lado de texturas exige manter transições do consumidor, validade dos níveis e publicação depois da prontidão do upload, inclusive nos bakes.
 - O trabalho paralelo de CPU ocorre dentro da preparação de uma submissão, além do relay já existente. As versões de staging e de escrita vivem parcialmente nos próprios objetos. Preparar duas submissões CPU em paralelo requer versionar esses dados e transferir a dependência de publicação para a etapa ordenada de execução. O ring dá vida útil independente ao payload carded. Staging de texturas e snapshots conservam o modelo atual.
 - O ring mantém 32 MiB adicionais de upload mapeado enquanto o processo está ativo. A primeira alocação pode afetar o aquecimento. As ondas mistas competem pelo pool e pela largura de banda da CPU. Os valores da telemetria e a semântica de publicação dos descritores precisam de A/B no jogo.
+- `cpu-stream-direct` evita o compare, mas pode enviar mais bytes que o caminho de diferenças quando poucas palavras mudam numa página de 4 KiB. Compare esse campo com `card-up` e com o tempo de GPU. A evidência de propriedade cobre os intervalos sem escritor GPU conhecido na cópia, sem reclassificar os produtores de skinning que alcançam o heap inteiro.
 
 ## Arquivos
 
@@ -97,6 +105,8 @@ A abertura elegível evita `GUARDS`, a fila `OPENED` e alocação de metadados d
 | `host/send.rs`, `texture.rs` | `ring_memory`, `take_with`, `Own::record`, `give_back` e medição de `Staging::refresh`. |
 | `descriptor.rs`, `rf_x4.rs` | `begin_sync_heaps`, `sync_heaps`, `note_indexed`, comparação em blocos e medição das esperas da gravação. |
 | `queue.rs`, `queue/behind.rs` | Medição da captura e seleção da fila existente com os seus pré-requisitos. |
+| `host/x9_plan.rs`, `host.rs` | Indexação assíncrona em `jobs_of`, expansão de refreshes bindless e sua contabilidade em `prepare_x9_heap_sweeps`. |
+| `draw.rs`, `descriptor/host.rs` | Ganchos `rf-x9` em `heap_buffers` e na ligação da UAV raiz. `buffer_uav` informa as faixas graváveis da vista normal e da raw. |
 
 ## Validação no Series S
 
@@ -108,6 +118,6 @@ Grave as chaves em `%LOCALAPPDATA%\victory\victory-settings.txt` e reinicie entr
 | Comparação de bytes | 1 | 1 | 1 |
 | Medição | 1 | 0 | 1 |
 
-Repita a cena olhando para uma parede e o trecho dirigindo. Compare cadência real, CPU de submissão, esperas de descritores, tempo de fault, uploads, readbacks e `rf-x9 diverge`. Exercite streaming, cortes de cena com remaps, geometria e skinning, bindless, bakes e água. O bitmap deve aparecer somente com X9 ativo e abertura elegível. Para retornar à referência, use `VICTORY_RF_X9=0` ou remova a chave.
+Repita a cena olhando para uma parede e o trecho dirigindo. Compare cadência real, CPU de submissão, esperas de descritores, tempo de fault, uploads, readbacks e `rf-x9 diverge`. Exercite streaming, cortes de cena com remaps, geometria e skinning, bindless, bakes e água. O bitmap aparece com X9 ativo e abertura elegível. O X9 é ativo quando a chave está ausente. Para retornar à referência, grave `VICTORY_RF_X9=0`.
 
-Os testes novos cobrem união e cobertura de intervalos, retomada do envelope após declaração GPU, entrega pelo bitmap, exclusão durante remap, empacotamento de uploads, dependências por destino e aposentadoria fora de ordem no ring. Os testes existentes incluem `queue::behind::tests`, `heap_marks::tests`, `written_spans_tests` e os de `watch`, `demand` e `upload`. Compilação, execução dos testes e jogo ficam com o usuário. A validação desta entrega foi feita por inspeção e `git diff --check`.
+Os testes novos cobrem união, interseção e cobertura de intervalos, retomada do envelope após declaração GPU, primeira inicialização de páginas sob flights, entrega pelo bitmap, exclusão durante remap, empacotamento de uploads, dependências por destino, aposentadoria fora de ordem no ring e reciclagem de listas enquanto há planos pendentes. Os testes existentes incluem `queue::behind::tests`, `heap_marks::tests`, `written_spans_tests` e os de `watch`, `demand` e `upload`. Compilação, execução dos testes e jogo ficam com o usuário. A validação desta entrega foi feita por inspeção e `git diff --check`.

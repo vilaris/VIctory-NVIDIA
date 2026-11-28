@@ -6568,8 +6568,8 @@ impl Host {
         self.execute_parts(lists, order, &[]);
     }
 
-    fn prepare_x9_heap_sweeps(&self, runs: &[&HostList], submitted: &mut u64) {
-        let _time = crate::rf_x9::timer(crate::rf_x9::Work::HeapDiscovery);
+    fn prepare_x9_heap_sweeps(&self, runs: &[&HostList], submitted: &mut u64, late: bool) -> std::time::Duration {
+        let began = std::time::Instant::now();
         let ranges: Vec<_> = runs.iter().flat_map(|list| {
             let deferred = list.deferred();
             if deferred.x9_heaps_resolved {
@@ -6578,10 +6578,15 @@ impl Host {
                 deferred.x9_heap_sweeps.iter().map(|(_, heap)| heap.range()).collect()
             }
         }).collect();
-        {
+        let waiting = std::time::Instant::now();
+        let mut landed = !late;
+        if !late {
+            self.settle(submitted, WHY_SYNC);
+        } else {
             let overlaps = |line: &Line| ranges.iter().any(|&(lo, hi)| touches(&line.written, lo, hi));
             let must_land = overlaps(&line());
             if must_land {
+                landed = true;
                 if relay_exact() {
                     relay_wait(WHY_READ, |line| !overlaps(line));
                 } else {
@@ -6589,14 +6594,23 @@ impl Host {
                 }
             }
         }
+        let waited = waiting.elapsed();
         // Resolve the raw records after the title's waits and after any
         // landing that supplies them. Each resolved read is fed back into
         // the ordinary flight, watch and card-steps planning at its index.
-        drop(crate::descriptor::begin_sync_heaps());
+        let _time = crate::rf_x9::timer(crate::rf_x9::Work::HeapDiscovery);
+        let mark = if landed { 0 } else { crate::heap_marks::needed() };
+        drop(crate::descriptor::begin_sync_heaps_after(mark));
         let frame = crate::frame::current();
         for list in runs {
             list.resolve_x9_heap_sweeps(frame);
         }
+        let elapsed = began.elapsed();
+        let active = elapsed.saturating_sub(waited);
+        SPLIT[13].fetch_add(waited.as_nanos() as u64, Ordering::Relaxed);
+        SPLIT[14].fetch_add(active.as_nanos() as u64, Ordering::Relaxed);
+        SUBMISSION_US[0].fetch_add(active.as_micros() as u64, Ordering::Relaxed);
+        elapsed
     }
 
     /// [`Host::execute_late`] of parts of submissions in one: another begins
@@ -6614,7 +6628,7 @@ impl Host {
                 && runs.iter().any(|list| list.deferred().copies.iter().any(|step| matches!(step, Step::Placed(_))))
             {
                 let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-                self.prepare_x9_heap_sweeps(&runs, &mut submitted);
+                self.prepare_x9_heap_sweeps(&runs, &mut submitted, true);
             }
             card_steps::cut_for(&runs)
         } {
@@ -6970,12 +6984,11 @@ impl Host {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let x9 = crate::rf_x9::enabled();
         let x9_heaps_prepared = x9 && runs.iter().any(|list| list.x9_heap_sweep_pending());
-        if x9_heaps_prepared {
-            if !late {
-                self.settle(&mut submitted, WHY_SYNC);
-            }
-            self.prepare_x9_heap_sweeps(runs, &mut submitted);
-        }
+        let x9_heap_time = if x9_heaps_prepared {
+            self.prepare_x9_heap_sweeps(runs, &mut submitted, late)
+        } else {
+            std::time::Duration::ZERO
+        };
         // Upscalings these lists recorded, in submission order: the next
         // present tags the latest (frame generation).
         for run in runs {
@@ -7000,7 +7013,7 @@ impl Host {
             && heap_sync_first())
             .then(crate::descriptor::begin_sync_heaps);
         let ahead = Split::begin();
-        SPLIT[11].fetch_add(called.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        SPLIT[11].fetch_add(called.elapsed().saturating_sub(x9_heap_time).as_nanos() as u64, Ordering::Relaxed);
         stage.next("submit: steps given to the card");
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
@@ -7011,7 +7024,9 @@ impl Host {
         stage.next("submit: waiting for flights it reads from");
         let mut waited_for_flights = false;
         if !late {
-            self.settle(&mut submitted, WHY_SYNC);
+            if !x9_heaps_prepared {
+                self.settle(&mut submitted, WHY_SYNC);
+            }
         } else if own.is_none()
             && let Some(why) = late_blocked(runs)
         {
