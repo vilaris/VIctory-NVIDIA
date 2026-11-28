@@ -52,7 +52,8 @@ mod windows_impl {
             Switches {
                 stats: on("VICTORY_RF_X7_STATS"),
                 title: on("VICTORY_RF_X7_TITLE_UAV"),
-                narrow: on("VICTORY_RF_X7_NARROW"),
+                // On by default (measured: steadier frames, no crash); "0" turns it off.
+                narrow: std::env::var_os("VICTORY_RF_X7_NARROW").is_none_or(|v| v != "0"),
                 verify: on("VICTORY_RF_X7_VERIFY"),
                 validate: on("VICTORY_RF_X7_VALIDATE"),
             }
