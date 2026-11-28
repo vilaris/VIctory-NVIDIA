@@ -4898,6 +4898,8 @@ fn buffer_uav(
         return None;
     }
     let host = host()?;
+    let element = if raw { 4 } else if stride != 0 { u64::from(stride) } else { element };
+    shadow.x9_note_writer(shadow.span().0 + first * element, u64::from(count) * element);
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
@@ -4906,6 +4908,7 @@ fn buffer_uav(
     if let Some(twin) = twin {
         let window = twin_window(desc.Format, first, count, stride, raw, width);
         if let Some((first, count, by)) = window {
+            shadow.x9_note_writer(shadow.span().0 + first * 4, u64::from(count) * 4);
             desc.Format = DXGI_FORMAT_R32_TYPELESS;
             desc.Anonymous.Buffer = D3D12_BUFFER_UAV {
                 FirstElement: first,

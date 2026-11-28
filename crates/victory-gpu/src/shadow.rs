@@ -112,6 +112,9 @@ pub(crate) struct Shadow {
     /// Of a copy with two sides: only the dwords the title changed go up,
     /// as with [`send_changed`] ([`by_address`]).
     changes_only: std::sync::atomic::AtomicBool,
+    // Guest byte ranges reachable through a GPU writer of this host copy.
+    // Once exposed, a view reused by a previously recorded list can still write.
+    x9_gpu_writers: std::sync::OnceLock<Mutex<crate::rf_x9::Ranges>>,
     /// Whether its title memory is write-combined ([`Shadow::write_combined`]):
     /// 0 not known yet, 1 no, 2 yes.
     wc: AtomicU8,
@@ -4130,6 +4133,7 @@ impl Shadow {
             card: None,
             window: false,
             changes_only: Default::default(),
+            x9_gpu_writers: Default::default(),
             wc: AtomicU8::new(0),
             mapped: false,
             place: None,
@@ -4159,6 +4163,7 @@ impl Shadow {
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         list.rf_x3_write(self, len.min(self.left(address)));
+        self.x9_note_writer(address, len);
         // In place the shaders write title memory itself: no snapshot, no
         // compare, nothing to copy back, and no wait on its account.
         // shortcut: another host copy of the same bytes (a title buffer
@@ -4214,6 +4219,7 @@ impl Shadow {
     /// memory (fresh snapshots cost ~2.3 million page faults per world
     /// frame).
     pub(crate) fn writing(&self, address: usize, len: usize) {
+        self.x9_note_writer(address as u64, len as u64);
         if self.place.is_some() {
             return;
         }
@@ -5267,7 +5273,7 @@ impl Shadow {
             crate::demand::fulfill_range(from, to - from, false);
             let _copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
             crate::host::rf_x5::copied(to - from);
-            let copied = self.take_all(vec![(from, to, false)]);
+            let copied = self.take_all(vec![(from, to, false)], false);
             traffic(Traffic::GuardRefresh, || copied as u64);
             return copied;
         }
@@ -5279,7 +5285,7 @@ impl Shadow {
                 // (A range whose blocks rest after a write has no guard now.)
                 let guarded = crate::watch::guarded(from, to) || self.watched.load(Ordering::Relaxed) == GUARDED;
                 self.note_watch(if guarded { GUARDED } else { 1 });
-                let copied = self.copy_stale(from, to, now, &written);
+                let copied = self.copy_stale(from, to, now, &written, !guarded && crate::rf_x9::enabled());
                 traffic(if guarded { Traffic::GuardRefresh } else { Traffic::KernelRefresh }, || copied as u64);
                 if let Some((sig, ask_end)) = clean_before {
                     self.stamp_clean(from, to, sig, ask_end);
@@ -5376,7 +5382,7 @@ impl Shadow {
     /// 4 KiB parts where the journal tells them apart, else whole pages,
     /// within the buffer ([`stale_runs`]); then notes what the range holds
     /// as taken ([`stamp_taken`]).
-    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)], stream: bool) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let buffer = (start, end, start / PAGE);
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
@@ -5404,7 +5410,7 @@ impl Shadow {
         // of the copy looks at the notes before they are.
         stamp_taken(from, to, buffer, &mut copied, &mut parts, now);
         drop(parts);
-        let bytes = self.take_all(runs);
+        let bytes = self.take_all(runs, stream);
         if crate::watch::light() {
             // All of the range is in the copy as of this asking.
             let mut ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
@@ -5419,13 +5425,13 @@ impl Shadow {
     /// [`Shadow::take`] of `runs` (from, to, known), on several threads if
     /// they are long: the big heap's copy has some 4 MB of them in each of
     /// 14 refreshes a frame, on one thread while the others had nothing.
-    fn take_all(&self, runs: Vec<(usize, usize, bool)>) -> usize {
+    fn take_all(&self, runs: Vec<(usize, usize, bool)>, stream: bool) -> usize {
         const LONG: usize = 1 << 20;
         const PART: usize = 256 << 10;
         let bytes = runs.iter().map(|r| r.1 - r.0).sum();
         if bytes < LONG || !crate::watch::light() {
             for (from, to, known) in runs {
-                self.take(from, to, known);
+                self.take(from, to, known, stream);
             }
             return bytes;
         }
@@ -5445,7 +5451,7 @@ impl Shadow {
             // the borrow of `self` ends. The parts lie apart.
             let this = unsafe { &*(this as *const Shadow) };
             let (from, to, known) = parts[i];
-            this.take(from, to, known);
+            this.take(from, to, known, stream);
         });
         bytes
     }
@@ -5528,7 +5534,7 @@ impl Shadow {
 
     /// Copies title memory `[from, to)` (inside the buffer) into the copy;
     /// `known`: the copy held it before ([`send_changed`]).
-    fn take(&self, from: usize, to: usize, known: bool) -> usize {
+    fn take(&self, from: usize, to: usize, known: bool, stream: bool) -> usize {
         let Some(card) = self.card.as_ref().filter(|_| self.changes_only.load(Ordering::Relaxed) || send_changed()) else {
             if known && self.card.is_some() && self.landing.load(Ordering::Acquire) && land_echo() && !crate::host::upcheck::on() {
                 return self.take_landed(from, to);
@@ -5536,11 +5542,15 @@ impl Shadow {
             return self.copy(from, to);
         };
         let whole = !known && !card.has_before.load(Ordering::Acquire);
-        if whole && crate::rf_x9::enabled() && !crate::host::upcheck::on() {
-            // The legacy compare bypass already marks every byte dirty in
-            // this case. Fill the mapped CPU side directly, preserving both
-            // the shadow stamps and the ordinary dirty-send bookkeeping.
+        let stream = stream && self.x9_cpu_stream(from, to);
+        if crate::rf_x9::enabled() && (whole || stream) && !crate::host::upcheck::on() {
+            // The watch supplied these bytes as dirty and there are no GPU
+            // stores to preserve in a CPU-stream interval. The legacy
+            // full initialization also marks every byte of its run dirty.
             let bytes = self.copy(from, to);
+            if stream {
+                crate::rf_x9::traffic(crate::rf_x9::Traffic::CpuStreamDirect, || bytes as u64);
+            }
             SEND[0].fetch_add(bytes as u64, Ordering::Relaxed);
             SEND[2].fetch_add(bytes as u64, Ordering::Relaxed);
             SEND[3].fetch_add((to.div_ceil(PAGE) - from / PAGE) as u64, Ordering::Relaxed);
@@ -5645,6 +5655,34 @@ impl Shadow {
     /// ([`cards`]).
     pub(crate) fn carded(&self) -> bool {
         self.card.is_some()
+    }
+
+    pub(crate) fn x9_note_writer(&self, address: u64, len: u64) {
+        if !crate::rf_x9::enabled() || len == 0 || !self.carded() {
+            return;
+        }
+        let from = address.max(self.start);
+        let to = address.saturating_add(len).min(self.start + self.len);
+        if from < to {
+            let mut writers = self.x9_gpu_writers.get_or_init(Mutex::default).lock().unwrap_or_else(|e| e.into_inner());
+            if !writers.covers(from as usize, to as usize) {
+                writers.insert(from as usize, to as usize);
+                crate::rf_x9::gpu_writer_exposed();
+            }
+        }
+    }
+
+    /// Kernel-watched private memory gives us the dirty parts directly.
+    /// With no GPU writer reaching this interval the CPU owns those bytes,
+    /// so the upload may take them without comparing to the CPU shadow.
+    fn x9_cpu_stream(&self, from: usize, to: usize) -> bool {
+        self.watched.load(Ordering::Relaxed) == 1
+            && !self.window
+            && !self.mapped
+            && !self.changes_only.load(Ordering::Acquire)
+            && self.x9_gpu_writers.get().is_none_or(|writers| {
+                !writers.lock().unwrap_or_else(|e| e.into_inner()).intersects(from, to)
+            })
     }
 
     /// The range planner can leave gaps between explicit CPU refreshes

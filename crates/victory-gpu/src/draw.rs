@@ -2336,6 +2336,7 @@ impl State {
             list.rf_x3_shadow(s, crate::rf_x3::Access::Uav, a, len, writes);
             s.refresh(list, a, len);
             if writes {
+                s.x9_note_writer(s.span().0, s.span().1); // rf-x9: root UAV, including its aligned prefix
                 #[cfg(feature = "diagnostics")]
                 crate::host::wide_write(a, len, pipeline);
                 // The footprint this pipeline's shader wrote through this
