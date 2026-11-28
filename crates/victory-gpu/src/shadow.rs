@@ -5200,6 +5200,7 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
+        use crate::rf_x9::{Traffic, traffic};
         if crate::watch::dirty_copy(from, to) {
             // No clean stamp is issued. These are gaps outside pending GPU
             // writes, and `take` still honors the card's upload bookkeeping.
@@ -5207,7 +5208,9 @@ impl Shadow {
             crate::demand::fulfill_range(from, to - from, false);
             let _copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
             crate::host::rf_x5::copied(to - from);
-            return self.take_all(vec![(from, to, false)]);
+            let copied = self.take_all(vec![(from, to, false)]);
+            traffic(Traffic::GuardRefresh, || copied as u64);
+            return copied;
         }
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             let clean_before = (self.pending_len.load(Ordering::Acquire) == 0)
@@ -5216,8 +5219,9 @@ impl Shadow {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 // (A range whose blocks rest after a write has no guard now.)
                 let guarded = crate::watch::guarded(from, to) || self.watched.load(Ordering::Relaxed) == GUARDED;
-                self.watched.store(if guarded { GUARDED } else { 1 }, Ordering::Relaxed);
+                self.note_watch(if guarded { GUARDED } else { 1 });
                 let copied = self.copy_stale(from, to, now, &written);
+                traffic(if guarded { Traffic::GuardRefresh } else { Traffic::KernelRefresh }, || copied as u64);
                 if let Some((sig, ask_end)) = clean_before {
                     self.stamp_clean(from, to, sig, ask_end);
                 }
@@ -5230,16 +5234,25 @@ impl Shadow {
                 }
                 return copied;
             }
-            self.watched.store(NOT_WATCHED, Ordering::Relaxed);
+            self.note_watch(NOT_WATCHED);
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self.copy(from, to);
+        traffic(Traffic::UntrackedRefresh, || (to - from) as u64);
         #[cfg(feature = "diagnostics")]
         crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
         to - from
+    }
+
+    fn note_watch(&self, watched: u8) {
+        let before = self.watched.load(Ordering::Relaxed);
+        self.watched.store(watched, Ordering::Relaxed);
+        if before != 0 && before != watched {
+            crate::rf_x9::watch_changed();
+        }
     }
 
     /// Diagnostic (`VICTORY_REFRESH_CHECK=1`; off by default): after a
@@ -5464,6 +5477,16 @@ impl Shadow {
             return self.copy(from, to);
         };
         let whole = !known && !card.has_before.load(Ordering::Acquire);
+        if whole && crate::rf_x9::enabled() && !crate::host::upcheck::on() {
+            // The legacy compare bypass already marks every byte dirty in
+            // this case. Fill the mapped CPU side directly, preserving both
+            // the shadow stamps and the ordinary dirty-send bookkeeping.
+            let bytes = self.copy(from, to);
+            SEND[0].fetch_add(bytes as u64, Ordering::Relaxed);
+            SEND[2].fetch_add(bytes as u64, Ordering::Relaxed);
+            SEND[3].fetch_add((to.div_ceil(PAGE) - from / PAGE) as u64, Ordering::Relaxed);
+            return bytes;
+        }
         let start = self.start as usize;
         // Title memory is read through the kernel in chunks of up to this
         // many pages, not a call a page: the call's own cost was paid some
@@ -5563,6 +5586,32 @@ impl Shadow {
     /// ([`cards`]).
     pub(crate) fn carded(&self) -> bool {
         self.card.is_some()
+    }
+
+    /// The range planner can leave gaps between explicit CPU refreshes
+    /// for mapped host buffers. GPU writers and address-space resources
+    /// continue using the conservative covering interval.
+    pub(crate) fn x9_narrow_refresh(&self) -> bool {
+        !self.carded()
+            && !self.in_place()
+            && !self.window
+            && !self.mapped
+            && !self.changes_only.load(Ordering::Relaxed)
+            && !self.written()
+            && !self.writes_pending()
+    }
+
+    pub(crate) fn x9_verify_refresh(&self, from: usize, to: usize) {
+        if self.x9_narrow_refresh() {
+            let (lo, hi) = self.inside(from, to - from);
+            let data = self.data.wrapping_add(lo) as usize;
+            let class = match self.watched.load(Ordering::Relaxed) {
+                1 => "write-watch",
+                GUARDED => "guarded",
+                _ => "untracked",
+            };
+            crate::rf_x9::verify_memory(class, self.start as usize + lo, data, hi - lo);
+        }
     }
 
     /// Shaders store in it what is not declared: from here on only the dwords

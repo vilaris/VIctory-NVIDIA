@@ -115,6 +115,7 @@ fn shard(block: usize) -> std::sync::MutexGuard<'static, Option<ShardMap>> {
 fn mark_cpu_read(block: usize) {
     if set_bit(&CPU_READ, block) {
         STATS[KNOWN_READ_BLOCKS].fetch_add(1, Ordering::Relaxed);
+        crate::rf_x9::eager_landing();
     }
 }
 
@@ -151,6 +152,16 @@ pub(crate) fn pin_range(at: usize, len: usize) -> Pin {
         }
     }
     Pin { from, to }
+}
+
+/// Protects the X9 guard opener from racing a demand-landing protection
+/// change. Unlike pin_range, this operation never lands bytes or waits.
+pub(crate) fn try_pin_fault(block: usize) -> Option<Pin> {
+    let pin = PINNED.get(block)?;
+    pin.fetch_add(1, Ordering::SeqCst);
+    let held = Pin { from: block, to: block + 1 };
+    let guarded = GUARDED[block / 64].load(Ordering::SeqCst) & (1 << (block % 64)) != 0;
+    (!guarded).then_some(held)
 }
 
 /// Attempts to defer landing of piece `[lo, hi)` of `shadow`.
@@ -200,8 +211,28 @@ pub(crate) fn park(shadow: &Arc<crate::shadow::Shadow>, lo: usize, hi: usize, fe
         }
     }
 
-    for &addr in &addrs {
-        set_bit(&GUARDED, addr / BLOCK);
+    if crate::rf_x9::enabled() {
+        for (i, &addr) in addrs.iter().enumerate() {
+            let block = addr / BLOCK;
+            let mask = 1u64 << (block % 64);
+            if GUARDED[block / 64].fetch_or(mask, Ordering::SeqCst) & mask != 0 {
+                for &made in &addrs[..i] {
+                    clear_bit(&GUARDED, made / BLOCK);
+                }
+                return false;
+            }
+        }
+        // If a fault didn't see the guard bit, this check sees its pin.
+        if addrs.iter().any(|&addr| PINNED[addr / BLOCK].load(Ordering::SeqCst) != 0) {
+            for &addr in &addrs {
+                clear_bit(&GUARDED, addr / BLOCK);
+            }
+            return false;
+        }
+    } else {
+        for &addr in &addrs {
+            set_bit(&GUARDED, addr / BLOCK);
+        }
     }
 
     let mut views = Vec::with_capacity(addrs.len());
@@ -293,6 +324,7 @@ pub(crate) fn on_fault(at: usize, permanent: bool) -> bool {
     if !has_bit(&GUARDED, block) {
         return false;
     }
+    let _fault = crate::rf_x9::timer(crate::rf_x9::Work::Fault);
     let canonical = ALIASES
         .lock()
         .unwrap_or_else(|e| e.into_inner())

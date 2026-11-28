@@ -602,6 +602,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
         if behind::on() && !this.is_null() {
+            let _capture = crate::rf_x9::timer(crate::rf_x9::Work::Capture);
             behind::submit(this, lists);
             return;
         }

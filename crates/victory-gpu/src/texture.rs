@@ -1431,9 +1431,11 @@ impl Staging {
     /// since the last time (and is mapped at all).
     pub(crate) fn refresh(&self) {
         use std::sync::atomic::Ordering::Relaxed;
+        let _job = crate::rf_x9::timer(crate::rf_x9::Work::Texture);
         let started = std::time::Instant::now();
         let _texture = crate::timeline::span("a texture's refresh");
         let read = self.refresh_now();
+        crate::rf_x9::traffic(crate::rf_x9::Traffic::TextureRead, || read as u64);
         let preparing = &crate::host::PREPARING;
         let us = started.elapsed().as_micros() as u64;
         preparing[2].fetch_add(us, Relaxed);

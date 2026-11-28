@@ -219,11 +219,58 @@ pub(super) struct Memory {
     buffer: ID3D12Resource,
     data: usize,
     size: u64,
+    offset: u64,
+    ring: Option<UploadLease>,
     vram: Option<VramBuffer>,
 }
 
-// SAFETY: a D3D12 object (free-threaded) and its mapping, with one owner.
+// SAFETY: a D3D12 object (free-threaded) and exclusive access to this slice.
 unsafe impl Send for Memory {}
+
+struct RingMemory {
+    buffer: ID3D12Resource,
+    data: usize,
+    slots: Mutex<crate::rf_x9::UploadRing>,
+}
+
+struct UploadLease {
+    slots: &'static Mutex<crate::rf_x9::UploadRing>,
+    token: u64,
+}
+
+impl Drop for UploadLease {
+    fn drop(&mut self) {
+        self.slots.lock().unwrap_or_else(|e| e.into_inner()).release(self.token);
+    }
+}
+
+const RING_BYTES: u64 = 32 << 20;
+
+fn ring_memory(host: &Host, size: u64) -> Option<Memory> {
+    static RING: OnceLock<Option<RingMemory>> = OnceLock::new();
+    if size > RING_BYTES {
+        return None;
+    }
+    let ring = RING.get_or_init(|| {
+        let (buffer, data) = host.upload_buffer(RING_BYTES)?;
+        name(&buffer, || "X9 submission upload ring".into());
+        Some(RingMemory {
+            buffer,
+            data: data as usize,
+            slots: Mutex::new(crate::rf_x9::UploadRing::new(RING_BYTES)),
+        })
+    }).as_ref()?;
+    let (offset, token) = ring.slots.lock().unwrap_or_else(|e| e.into_inner()).reserve(size)?;
+    crate::rf_x9::traffic(crate::rf_x9::Traffic::UploadRing, || size);
+    Some(Memory {
+        buffer: ring.buffer.clone(),
+        data: ring.data + offset as usize,
+        size,
+        offset,
+        ring: Some(UploadLease { slots: &ring.slots, token }),
+        vram: None,
+    })
+}
 
 /// What submissions that have run gave back.
 static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
@@ -250,6 +297,9 @@ fn on_card() -> bool {
 }
 
 fn memory(host: &Host, size: u64) -> Option<Memory> {
+    if crate::rf_x9::enabled() && !on_card() && let Some(memory) = ring_memory(host, size) {
+        return Some(memory);
+    }
     {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         let fit = spare.iter().enumerate().filter(|(_, m)| m.size >= size).min_by_key(|(_, m)| m.size).map(|(i, _)| i);
@@ -270,6 +320,8 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
         buffer,
         data: data as usize,
         size,
+        offset: 0,
+        ring: None,
         vram: None,
     })
 }
@@ -297,6 +349,9 @@ pub(super) fn give_back(mut memory: Memory) {
         while spare_vram.iter().map(|v| v.size).sum::<u64>() > KEPT_VRAM {
             spare_vram.remove(0);
         }
+    }
+    if memory.ring.is_some() {
+        return;
     }
     let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
     spare.push(memory);
@@ -530,19 +585,6 @@ fn take_with(
         }
     }
 
-    for (start, end, off) in tile_slices {
-        let slice = &all_tiles[start..end];
-        // SAFETY: `memory.data` has at least `total_upload` bytes and `off`
-        // reserves `slice.len() * TILE_STRIDE` disjoint bytes inside `[0..vram_at)`.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                slice.as_ptr().cast::<u8>(),
-                (memory.data + off as usize) as *mut u8,
-                std::mem::size_of_val(slice),
-            );
-        }
-    }
-
     let fallback_runs: usize = copies.iter().map(|c| c.runs.len()).sum();
     let mut moves: Vec<(usize, usize, usize)> = Vec::with_capacity(bulk_moves.len() + fallback_runs);
     moves.extend(
@@ -574,14 +616,51 @@ fn take_with(
             }
         }
     };
-    crate::land::each_under(pending_work.len(), &one);
-
     STATS[0].fetch_add(moves.iter().map(|m| m.2 as u64).sum(), Ordering::Relaxed);
     STATS[1].fetch_add(moves.len() as u64, Ordering::Relaxed);
     STATS[2].fetch_add(total_words, Ordering::Relaxed);
     STATS[4].fetch_add(copies.iter().flat_map(|copy| &copy.runs).map(|run| run.2 as u64).sum(), Ordering::Relaxed);
     STATS[5].fetch_add(vram_bytes, Ordering::Relaxed);
-    crate::shadow::copy_all(moves);
+    let tile_moves = tile_slices.into_iter().map(|(start, end, off)| {
+        let slice = &all_tiles[start..end];
+        (slice.as_ptr() as usize, memory.data + off as usize, std::mem::size_of_val(slice))
+    });
+    if crate::rf_x9::enabled() {
+        moves.extend(tile_moves);
+        // The plan has already assigned disjoint destinations to payload,
+        // tile tables and pairs. Run all three in one wave while the source
+        // shadows and this submission's upload allocation are still held.
+        let (moves, starts) = crate::rf_x9::upload_jobs(&moves, 256 << 10);
+        let pairs = pending_work.len();
+        crate::land::each_under(pairs + starts.len() - 1, &|i| {
+            let _job = crate::rf_x9::timer(crate::rf_x9::Work::UploadPack);
+            if i < pairs {
+                one(i);
+            } else {
+                let job = i - pairs;
+                copy_upload(&moves[starts[job]..starts[job + 1]]);
+            }
+        });
+        if crate::rf_x9::verify() {
+            for ((shadow, _), copy) in dirty.iter().zip(&copies) {
+                if let Some(&(at, offset, len)) = copy.runs.first() {
+                    // Check the CopyBufferRegion source that the recorded
+                    // command will read, relative to the legacy shadow.
+                    crate::rf_x9::verify_memory_at(
+                        "card-upload",
+                        shadow.span().0 as usize + at,
+                        shadow.card_data() as usize + at,
+                        memory.data + offset as usize,
+                        len,
+                    );
+                }
+            }
+        }
+    } else {
+        tile_moves.for_each(|m| copy_upload(std::slice::from_ref(&m)));
+        crate::land::each_under(pending_work.len(), &one);
+        crate::shadow::copy_all(moves);
+    }
     STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
 
     Some(Own {
@@ -589,6 +668,14 @@ fn take_with(
         copies,
         vram_bytes,
     })
+}
+
+fn copy_upload(moves: &[(usize, usize, usize)]) {
+    for &(src, dst, bytes) in moves {
+        // SAFETY: these moves are made by `take_with` from live sources to
+        // disjoint slices of its private upload mapping, then joined there.
+        unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, bytes) };
+    }
 }
 
 impl Own {
@@ -617,7 +704,7 @@ impl Own {
         {
             recorded += 1;
             // SAFETY: the caller's; live buffers, range inside both.
-            unsafe { list.CopyBufferRegion(&vram.buffer, 0, &self.memory.buffer, 0, self.vram_bytes) };
+            unsafe { list.CopyBufferRegion(&vram.buffer, 0, &self.memory.buffer, self.memory.offset, self.vram_bytes) };
             first.push(transition(&vram.buffer, dest, read));
             last.push(transition(&vram.buffer, read, common));
         }
@@ -627,7 +714,7 @@ impl Own {
             for (a, from, n) in joined_runs(&copy.runs) {
                 recorded += 1;
                 // SAFETY: the caller's; live buffers, ranges inside them.
-                unsafe { list.CopyBufferRegion(&shadow.buffer, a as u64, &self.memory.buffer, from, n as u64) };
+                unsafe { list.CopyBufferRegion(&shadow.buffer, a as u64, &self.memory.buffer, self.memory.offset + from, n as u64) };
             }
             let mut state = (looked(shadow) || !copy.runs.is_empty()).then_some(dest);
             let uav_writes = copy.tiles.1 > 0 || copy.pairs.1 > 0;
@@ -655,7 +742,7 @@ impl Own {
                 .memory
                 .vram
                 .as_ref()
-                .map_or_else(|| self.memory.buffer.GetGPUVirtualAddress(), |v| v.buffer.GetGPUVirtualAddress());
+                .map_or_else(|| self.memory.buffer.GetGPUVirtualAddress() + self.memory.offset, |v| v.buffer.GetGPUVirtualAddress());
             if let Some(bulk) = bulk_pass(host)
                 && self.copies.iter().any(|c| c.tiles.1 > 0)
             {

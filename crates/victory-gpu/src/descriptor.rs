@@ -162,6 +162,7 @@ impl Heap {
         let mut stamps = self.recorded_sync.lock().unwrap_or_else(|e| e.into_inner());
         let synced = &mut stamps[pass as usize];
         if synced.is_none_or(|previous| previous < frame) {
+            let _wait = crate::rf_x9::timer(crate::rf_x9::Work::RecordHeapWait);
             drop(begin_sync_heaps());
             *synced = Some(frame);
         }
@@ -191,7 +192,7 @@ impl Heap {
 
     #[cfg(windows)]
     pub(crate) fn note_verify_table(&self, slot: u32, shader: &crate::pipeline::Shader, title: This) {
-        if self.written.is_none() || !rf_x4::verify() {
+        if self.written.is_none() || !(rf_x4::verify() || crate::rf_x9::verify()) {
             return;
         }
         let pso = crate::pipeline::diagnostic_key(title).unwrap_or("-");
@@ -214,12 +215,19 @@ impl Heap {
         if !self.indexed.load(Acquire) {
             self.indexed.store(true, Release);
         }
+        if crate::rf_x9::enabled() && self.samplers() {
+            // The list retains the sampler heap. Sampler discovery has no
+            // buffer-shadow or texture-upload pass to feed while recording.
+            // The list's heap-pick bit requires a round before execution.
+            return;
+        }
         if rf_x4::picked() && rf_x4::late_lane() && sync_on() {
             self.picked_ready.get_or_init(|| {
                 // A round may have begun before the interval was published.
                 // Wait for a fresh one before the record-time heap passes, as
                 // they use the discovered buffer set and texture queue.
                 if self.host().is_some() {
+                    let _wait = crate::rf_x9::timer(crate::rf_x9::Work::RecordHeapWait);
                     drop(begin_sync_heaps());
                 }
             });
@@ -333,7 +341,7 @@ fn sync_on() -> bool {
 /// before the lists go to the queue, and nothing of the preparing looks at
 /// them (what a draw reads through a table it made itself, when recorded).
 #[cfg(windows)]
-fn sync_aside() -> bool {
+pub(crate) fn sync_aside() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| sync_on() && std::env::var_os("VICTORY_HEAP_SYNC_ASIDE").is_none_or(|v| v != "0"))
 }
@@ -419,10 +427,20 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
         return SyncedHeaps(None);
     }
     let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
-    rounds.0 += 1;
-    let mine = rounds.0;
+    let (mine, ask) = if crate::rf_x9::enabled() {
+        // A pending round that has not started yet already meets this
+        // caller's publication boundary. An active round never does.
+        crate::heap_marks::round_after(rounds.0, rounds.1)
+    } else {
+        (rounds.0 + 1, true)
+    };
+    if ask {
+        rounds.0 = mine;
+    }
     drop(rounds);
-    SYNC_ROUNDS.1.notify_all();
+    if ask {
+        SYNC_ROUNDS.1.notify_all();
+    }
     SyncedHeaps(Some(mine))
 }
 
@@ -541,13 +559,15 @@ pub(crate) fn sync_heaps() {
     // When the worker is disabled, recording and submission can both ask
     // for a round. Keep the write-watch cursor and publication in order.
     static DIRECT_ROUND: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _direct = (rf_x4::picked() || !rf_x4::speculative())
+    let x9 = crate::rf_x9::enabled();
+    let _direct = (rf_x4::picked() || !rf_x4::speculative() || x9)
         .then(|| DIRECT_ROUND.lock().unwrap_or_else(|e| e.into_inner()));
     let started = std::time::Instant::now();
     let x4_stats = rf_x4::stats();
     let x4_blocks = rf_x4::picked();
     let x4_filter = x4_blocks && rf_x4::late_lane();
-    let x4_verify = rf_x4::verify();
+    let blocks = x4_blocks || x9;
+    let x4_verify = rf_x4::verify() || crate::rf_x9::verify();
     let mut x4 = rf_x4::Sample::default();
     let (mut pages, mut looked, mut mirrored, mut tabled, mut later) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let (mut views, mut bytes) = (0u64, 0u64);
@@ -664,8 +684,9 @@ pub(crate) fn sync_heaps() {
         let in_place = sync_in_place() && step == 32 && crate::safecopy::on();
         let found: Vec<std::sync::Mutex<SyncPart>> = parts.chunks(pages_a_job).map(|_| Default::default()).collect();
         crate::land::each_view(true, found.len(), &|n| {
+            let _job = crate::rf_x9::timer(crate::rf_x9::Work::Descriptor);
             let mut out = SyncPart::default();
-            let (mut page_bytes, mut changed) = if x4_blocks { SYNC_SCRATCH.take() } else { (Vec::new(), Vec::new()) };
+            let (mut page_bytes, mut changed) = if blocks { SYNC_SCRATCH.take() } else { (Vec::new(), Vec::new()) };
             let mut bits: Vec<u64> = Vec::new();
             for &(from, to) in parts.chunks(pages_a_job).nth(n).unwrap_or_default() {
                 let slots = changed_slots(from, to, start as usize, step, mirrored_count);
@@ -688,7 +709,7 @@ pub(crate) fn sync_heaps() {
                         out.x4.reading_ns += since(at);
                         out.x4.compared_slots += count;
                     }
-                    if x4_blocks && !whole {
+                    if blocks && !whole {
                         out.retry.push(from);
                     }
                     out.pages += 1;
@@ -716,7 +737,7 @@ pub(crate) fn sync_heaps() {
                         out.x4.reading_ns += since(at);
                     }
                     if !read {
-                        if x4_blocks {
+                        if blocks {
                             out.retry.push(from);
                         }
                         continue;
@@ -736,9 +757,9 @@ pub(crate) fn sync_heaps() {
                     // another, and only records that lie whole in one are its.
                     let records_to_compare = &records[..(count * step) as usize];
                     let compare_at = x4_stats.then(std::time::Instant::now);
-                    if x4_blocks || x4_stats {
+                    if blocks || x4_stats {
                         out.x4.compared_slots += unsafe {
-                            copied.changes_x4(first as u32, records_to_compare, &mut changed, x4_blocks)
+                            copied.changes_x4(first as u32, records_to_compare, &mut changed, blocks)
                         };
                     } else {
                         unsafe { copied.changes(first as u32, records_to_compare, &mut changed) };
@@ -813,7 +834,7 @@ pub(crate) fn sync_heaps() {
                     out.x4_pages.push((from / crate::watch::PAGE, tabled_here, changed_here));
                 }
             }
-            if x4_blocks {
+            if blocks {
                 SYNC_SCRATCH.set((page_bytes, changed));
             }
             *found[n].lock().unwrap_or_else(|e| e.into_inner()) = out;
@@ -877,6 +898,7 @@ pub(crate) fn sync_heaps() {
             verify_heap(heap, host, written, end, step as usize, mirrored_count, true, frame);
         }
     }
+    crate::rf_x9::traffic(crate::rf_x9::Traffic::DescriptorRead, || bytes);
     drop(heaps);
     let micros = started.elapsed().as_micros() as u64;
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, micros, tabled, later]) {
@@ -993,6 +1015,15 @@ fn verify_heap(
         if !crate::host::read_into(handle as *const u8, &mut now) || record_words(&now) != expected {
             reference.pending.insert(slot, expected);
             continue;
+        }
+        if crate::rf_x9::verify() {
+            tracing::warn!(
+                class = "descriptor",
+                address = format_args!("{handle:#x}"),
+                len = step,
+                ?expected, ?scanned, mirrored_key = ?visible,
+                "rf-x9 diverge"
+            );
         }
         let readers = heap.verify_readers.lock().unwrap_or_else(|e| e.into_inner());
         let readers: Vec<_> = readers.iter().map(|r| (&r.pso, &r.hash, &r.shader)).collect();
