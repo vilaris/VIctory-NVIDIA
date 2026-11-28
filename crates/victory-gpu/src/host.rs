@@ -7131,9 +7131,15 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
-        batch.fill();
+        if !x9 {
+            batch.fill();
+        }
         stage.next("submit: the last refreshes");
-        batch.flush();
+        if x9 {
+            batch.finish();
+        } else {
+            batch.flush();
+        }
         crate::watch::ask_once_end();
         if batch.heap_written {
             // The previous round may have read the raw records before a
@@ -10503,18 +10509,33 @@ impl Batch {
         PREPARING[2].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
     }
 
+    fn finish(&mut self) {
+        self.flush_wave(true);
+    }
+
     fn flush(&mut self) {
-        let mixed = crate::rf_x9::enabled() && wide_refresh() && !self.refreshes.is_empty() && !self.due.is_empty();
+        self.flush_wave(false);
+    }
+
+    fn flush_wave(&mut self, finish: bool) {
+        let refreshes = !self.refreshes.is_empty();
+        let textures = !self.due.is_empty();
+        let fills = finish && !self.fills.is_empty();
+        let mixed = crate::rf_x9::enabled() && wide_refresh()
+            && [refreshes, textures, fills].into_iter().filter(|present| *present).count() >= 2;
         if !mixed {
+            if finish {
+                self.fill();
+            }
             self.refresh_textures();
         }
         self.index.clear();
-        if self.refreshes.is_empty() {
+        if !mixed && self.refreshes.is_empty() {
             return;
         }
         let (began, all) = (std::time::Instant::now(), self.refreshes.len());
         let _flush = crate::timeline::span("refreshes of copies");
-        self.flush_all(mixed);
+        self.flush_all(mixed, fills);
         let ns = began.elapsed().as_nanos() as u64;
         SPLIT[6].fetch_add(ns, Ordering::Relaxed);
         crate::rf_x3::refresh_wall(crate::rf_x3::Check::FlushWall, ns); // rf-x3
@@ -10522,7 +10543,7 @@ impl Batch {
         FLUSHES[1].fetch_add(all as u64, Ordering::Relaxed);
     }
 
-    fn flush_all(&mut self, mixed: bool) {
+    fn flush_all(&mut self, mixed: bool, include_fills: bool) {
         // Most of a flush's copies are as they were: they are told so here,
         // from what the submission's asking found, before anything is asked
         // and any thread woken. (Thousands of them, the heap's buffer views
@@ -10560,17 +10581,27 @@ impl Batch {
         if mixed {
             let refreshes = std::mem::take(&mut self.refreshes);
             let textures = std::mem::take(&mut self.due);
+            let fills = if include_fills { std::mem::take(&mut self.fills) } else { Vec::new() };
+            let observed = include_fills.then(|| crate::rf_x3::observe_fills(&fills)).flatten();
             let texture_before = PREPARING[2].load(Ordering::Relaxed);
             let copy_before = PREPARING[0].load(Ordering::Relaxed);
             let started = std::time::Instant::now();
             FLUSHES[3].fetch_add(refreshes.len() as u64, Ordering::Relaxed);
-            crate::shadow::wide_each(textures.len() + refreshes.len(), move |i| {
+            let (fill_order, fill_starts) = crate::rf_x9::fill_jobs(&fills);
+            let jobs = textures.len() + refreshes.len() + fill_starts.len() - 1;
+            crate::shadow::wide_each(jobs, move |i| {
                 if let Some(staging) = textures.get(i) {
                     staging.refresh();
-                } else {
-                    let (shadow, from, to) = &refreshes[i - textures.len()];
+                } else if let Some((shadow, from, to)) = refreshes.get(i - textures.len()) {
                     let key = std::sync::Arc::as_ptr(shadow) as usize;
                     Self::update_ranges(shadow, *from, *to, exact.get(&key));
+                } else {
+                    let _job = crate::rf_x9::timer(crate::rf_x9::Work::Fill);
+                    let job = i - textures.len() - refreshes.len();
+                    for &index in &fill_order[fill_starts[job]..fill_starts[job + 1]] {
+                        let (dst, src, len, _) = fills[index];
+                        Self::fill_upload(dst, src, len);
+                    }
                 }
             });
             // Both streams occupied one wall interval. Leave the summed
@@ -10579,7 +10610,9 @@ impl Batch {
             let copies = PREPARING[0].load(Ordering::Relaxed).saturating_sub(copy_before);
             PREPARING[2].fetch_sub(textures, Ordering::Relaxed);
             PREPARING[0].fetch_sub(copies, Ordering::Relaxed);
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            let took = started.elapsed();
+            PREPARING[0].fetch_add(took.as_micros() as u64, Ordering::Relaxed);
+            crate::rf_x3::fills(observed, took);
         } else if wide_refresh() && self.refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.

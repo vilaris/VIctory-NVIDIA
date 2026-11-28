@@ -114,6 +114,32 @@ pub(crate) fn upload_jobs(
     (copies, starts)
 }
 
+/// Jobs can fill separate upload ranges at once. If a destination is
+/// reused, all overlapping writes stay in one job in original order.
+#[cfg(any(windows, test))]
+pub(crate) fn fill_jobs(fills: &[(usize, usize, usize, bool)]) -> (Vec<usize>, Vec<usize>) {
+    const MIN_JOB: usize = 32;
+    let mut order: Vec<_> = (0..fills.len()).collect();
+    order.sort_unstable_by_key(|&i| fills[i].0);
+    let mut starts = vec![0];
+    let (mut first, mut end) = (0, 0);
+    for (position, &i) in order.iter().enumerate() {
+        let (target, _, bytes, _) = fills[i];
+        if target >= end && position - first >= MIN_JOB {
+            starts.push(position);
+            first = position;
+        }
+        end = end.max(target.saturating_add(bytes));
+    }
+    if !order.is_empty() {
+        starts.push(order.len());
+    }
+    for bounds in starts.windows(2) {
+        order[bounds[0]..bounds[1]].sort_unstable();
+    }
+    (order, starts)
+}
+
 /// Tracks the live slices of one persistently mapped upload buffer. A
 /// reservation never crosses the physical end. Out-of-order retirement
 /// cannot release an older live slice or the padding before it.
@@ -181,6 +207,7 @@ mod telemetry {
         RecordHeapWait,
         UploadPack,
         Texture,
+        Fill,
     }
 
     #[derive(Clone, Copy)]
@@ -196,8 +223,8 @@ mod telemetry {
         UploadRing,
     }
 
-    static WORK: [[AtomicU64; 2]; 7] =
-        [const { [const { AtomicU64::new(0) }; 2] }; 7];
+    static WORK: [[AtomicU64; 2]; 8] =
+        [const { [const { AtomicU64::new(0) }; 2] }; 8];
     static TRAFFIC: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
     static BITMAP: AtomicU64 = AtomicU64::new(0);
     static GAPS: AtomicU64 = AtomicU64::new(0);
@@ -253,7 +280,7 @@ mod telemetry {
             return;
         }
         let per_frame = |counter: &AtomicU64| counter.swap(0, Ordering::Relaxed) as f64 / frames;
-        let [refresh, descriptor, capture, fault, record_heap_wait, pack, texture] =
+        let [refresh, descriptor, capture, fault, record_heap_wait, pack, texture, fill] =
             WORK.each_ref().map(|row| [per_frame(&row[0]), per_frame(&row[1]) / 1e6]);
         let [scratch, upload, readback, descriptors, kernel, guard, untracked, texture_read, ring] =
             TRAFFIC.each_ref().map(|value| per_frame(value) / (1 << 20) as f64);
@@ -268,8 +295,8 @@ mod telemetry {
             per_frame(&WATCH_CHANGED), per_frame(&CPU_READ),
         );
         tracing::info!(
-            "rf-x9: jobs[count/ms per frame upload-pack={:.1}/{:.3} texture={:.1}/{:.3}] MiB/frame[texture-read={texture_read:.2} upload-ring={ring:.2}]",
-            pack[0], pack[1], texture[0], texture[1],
+            "rf-x9: jobs[count/ms per frame upload-pack={:.1}/{:.3} texture={:.1}/{:.3} fill={:.1}/{:.3}] MiB/frame[texture-read={texture_read:.2} upload-ring={ring:.2}]",
+            pack[0], pack[1], texture[0], texture[1], fill[0], fill[1],
         );
     }
 }
@@ -391,6 +418,15 @@ mod tests {
         assert!(ring.reserve(1).is_none());
         ring.release(second);
         assert_eq!(ring.reserve(1024).map(|r| r.0), Some(0));
+    }
+
+    #[test]
+    fn fill_jobs_keep_a_chain_of_overlapping_writes_ordered() {
+        let mut fills: Vec<_> = (0..30).map(|i| (i * 10, 0, 2, false)).collect();
+        fills.extend([(330, 0, 20, false), (300, 0, 20, false), (310, 0, 30, false), (400, 0, 2, false)]);
+        let (order, starts) = fill_jobs(&fills);
+        assert_eq!(starts, [0, 33, 34]);
+        assert_eq!(order, (0..34).collect::<Vec<_>>());
     }
 
     #[test]
