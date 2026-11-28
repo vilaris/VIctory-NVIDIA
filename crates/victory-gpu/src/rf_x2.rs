@@ -300,8 +300,17 @@ fn count_barriers(barriers: &[D3D12_RESOURCE_BARRIER], offset: usize) {
 /// Records the enhanced global synchronization used by placed copies.
 #[inline]
 #[track_caller]
-pub(crate) unsafe fn global_barrier(list: &ID3D12GraphicsCommandList7, groups: &[D3D12_BARRIER_GROUP]) {
-    crate::rf_x7::enhanced_globals(groups); // rf-x7
+pub(crate) unsafe fn global_barrier(base: &ID3D12GraphicsCommandList, list: &ID3D12GraphicsCommandList7, groups: &[D3D12_BARRIER_GROUP]) {
+    crate::rf_x7::enhanced_globals(base, groups); // rf-x7
+    if let Some(merged) = unsafe { crate::rf_x7::merge_global_groups(groups) } {
+        let group = D3D12_BARRIER_GROUP {
+            Type: D3D12_BARRIER_TYPE_GLOBAL,
+            NumBarriers: 1,
+            Anonymous: D3D12_BARRIER_GROUP_0 { pGlobalBarriers: &merged },
+        };
+        unsafe { record_global(list, "vx:barrier.place", &[group]) };
+        return;
+    }
     unsafe { record_global(list, "vx:barrier.place", groups) };
 }
 
@@ -329,6 +338,17 @@ pub(crate) unsafe fn record_barriers(list: &ID3D12GraphicsCommandList, reason: &
     }
     let _range = range(list, reason);
     // SAFETY: the original ResourceBarrier call's preconditions apply.
+    unsafe { list.ResourceBarrier(barriers) };
+}
+
+/// A single physical call with the leading title barrier adjacent to Victory's.
+pub(crate) unsafe fn record_mixed(list: &ID3D12GraphicsCommandList, reason: &str, barriers: &[D3D12_RESOURCE_BARRIER]) {
+    let (title, victory) = barriers.split_at(1);
+    if switches().stats {
+        count_barriers(title, TITLE_BARRIERS);
+        count_barriers(victory, 0);
+    }
+    let _range = range(list, reason);
     unsafe { list.ResourceBarrier(barriers) };
 }
 
