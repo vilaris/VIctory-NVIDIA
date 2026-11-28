@@ -6739,6 +6739,17 @@ pub(crate) fn in_buffer(address: u64, len: u64) -> Option<(u64, u64)> {
     found.map(|(k, e)| (k.0, e.end - k.0))
 }
 
+/// An X4 descriptor block can defer rearm only if no buffer or loose shadow
+/// covers any of it. Called under GUARDS, so never wait on either registry.
+pub(crate) fn descriptor_only(start: u64, end: u64) -> bool {
+    let Ok(buffers) = BUFFERS.try_read() else { return false };
+    if buffers.range(..(end, 0)).rev().any(|(_, entry)| entry.end > start) {
+        return false;
+    }
+    let Ok(loose) = LOOSE.try_read() else { return false };
+    !loose.range((start.saturating_sub(WINDOW), 0)..(end, 0)).any(|(&(at, len), _)| at + len > start)
+}
+
 /// Whether a title buffer of at most `most` bytes lies in `[address, address
 /// + len)`, all of it or in part.
 pub(crate) fn small_buffer_in(address: u64, len: u64, most: u64) -> bool {

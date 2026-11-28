@@ -9,9 +9,9 @@ pub(crate) struct Settings {
     pub stats: bool,
     pub always_dirty: bool,
     pub lazy_rearm: bool,
-    ratio: f64,
-    window: u32,
-    quiet: u64,
+    pub fast_fault: bool,
+    window: u64,
+    fault_ns_per_frame: u64,
     pause: u64,
 }
 
@@ -20,17 +20,16 @@ pub(crate) fn settings() -> &'static Settings {
     SETTINGS.get_or_init(|| {
         let on = |name| std::env::var_os(name).is_some_and(|v| v == "1");
         let number = |name| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
+        let always_dirty = on("VICTORY_RF_X5_ALWAYS_DIRTY");
         Settings {
             stats: on("VICTORY_RF_X5_STATS"),
-            always_dirty: on("VICTORY_RF_X5_ALWAYS_DIRTY"),
+            always_dirty,
             lazy_rearm: on("VICTORY_RF_X5_LAZY_REARM"),
-            ratio: std::env::var("VICTORY_RF_X5_DIRTY_RATIO").ok()
-                .and_then(|v| v.parse::<f64>().ok())
-                .filter(|v| *v > 0.0 && *v <= 1.0)
-                .unwrap_or(0.9),
-            window: number("VICTORY_RF_X5_DIRTY_WINDOW").filter(|v| (2..=64).contains(v)).unwrap_or(32) as u32,
-            quiet: number("VICTORY_RF_X5_DIRTY_QUIET").filter(|v| (1..=64).contains(v)).unwrap_or(4),
-            pause: number("VICTORY_RF_X5_DIRTY_PROBE").filter(|v| (1..=600).contains(v)).unwrap_or(32),
+            fast_fault: std::env::var_os("VICTORY_RF_X5_FAST_FAULT").map_or(always_dirty, |v| v == "1"),
+            window: number("VICTORY_RF_X5_DIRTY_WINDOW").filter(|v| (2..=64).contains(v)).unwrap_or(16),
+            fault_ns_per_frame: number("VICTORY_RF_X5_FAULT_US_PER_FRAME")
+                .filter(|v| (1..=1000).contains(v)).unwrap_or(12) * 1000,
+            pause: number("VICTORY_RF_X5_DIRTY_PROBE").filter(|v| (1..=600).contains(v)).unwrap_or(16),
         }
     })
 }
@@ -38,67 +37,60 @@ pub(crate) fn settings() -> &'static Settings {
 #[derive(Default)]
 pub(crate) struct Heat {
     first: u64,
-    last: u64,
     faults: u64,
-    phase: Phase,
-}
-
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-enum Phase {
-    #[default]
-    Track,
-    Pause(u64),
-    Probe(u64),
+    ns: u64,
+    pause_until: u64,
 }
 
 impl Heat {
-    /// A frame counts once, even with several submissions or faults. A
-    /// frame without a fault can only lower the observed rate.
-    pub(crate) fn fault(&mut self, frame: u64, settings: &Settings) {
-        match self.phase {
-            Phase::Pause(_) => return,
-            Phase::Probe(until) if frame < until => {
-                self.phase = Phase::Pause(frame + settings.pause);
-                return;
-            }
-            Phase::Probe(_) => *self = Self::default(),
-            Phase::Track => {}
+    /// Charge every guard opening to its block. Divide by the full observation
+    /// window, including frames without faults, even when a burst qualifies early.
+    pub(crate) fn fault(&mut self, frame: u64, ns: u64, settings: &Settings) {
+        if self.pauses(frame) {
+            return;
         }
-        if self.faults == 0 {
-            self.first = frame;
+        if self.faults == 0 || frame.saturating_sub(self.first) >= settings.window {
+            *self = Self { first: frame, ..Self::default() };
         }
-        let gap = frame.saturating_sub(self.last);
-        if gap != 0 {
-            self.faults = self.faults.checked_shl(gap.min(64) as u32).unwrap_or(0);
-        }
-        self.last = self.last.max(frame);
-        self.faults |= 1;
-        let count = (self.faults & (u64::MAX >> (64 - settings.window))).count_ones();
-        if frame.saturating_sub(self.first) + 1 >= u64::from(settings.window)
-            && f64::from(count) / f64::from(settings.window) >= settings.ratio
-        {
-            self.phase = Phase::Pause(frame + settings.pause);
+        self.faults += 1;
+        self.ns = self.ns.saturating_add(ns);
+        if self.faults >= 2 && self.ns >= settings.fault_ns_per_frame * settings.window {
+            self.pause_until = frame + settings.pause;
+            self.faults = 0;
+            self.ns = 0;
         }
     }
 
     pub(crate) fn pauses(&self, frame: u64) -> bool {
-        matches!(self.phase, Phase::Pause(until) if frame < until)
-    }
-
-    /// The quiet interval starts when a consuming watch actually rearmed the
-    /// page. Time spent unprotected cannot count as a quiet interval.
-    pub(crate) fn armed(&mut self, frame: u64, settings: &Settings) {
-        if matches!(self.phase, Phase::Pause(until) if frame >= until) {
-            self.phase = Phase::Probe(frame + settings.quiet);
-        }
+        frame < self.pause_until
     }
 
     pub(crate) fn retain(&self, frame: u64) -> bool {
-        match self.phase {
-            Phase::Track => frame.saturating_sub(self.last) <= 64,
-            Phase::Pause(until) => frame < until,
-            Phase::Probe(until) => frame < until,
+        self.pauses(frame) || self.faults != 0 && frame.saturating_sub(self.first) < settings().window
+    }
+}
+
+/// Global budget for work introduced by deferring descriptor rearm. Charge
+/// every deferral, including later reads of a page already left open.
+#[derive(Default)]
+pub(crate) struct DescriptorBudget {
+    frame: u64,
+    used: usize,
+}
+
+impl DescriptorBudget {
+    pub(crate) const EMPTY: Self = Self { frame: 0, used: 0 };
+
+    pub(crate) fn take(&mut self, frame: u64, eligible: impl FnOnce() -> bool) -> bool {
+        const BLOCKS_PER_FRAME: usize = (1 << 20) / crate::watch::PAGE;
+        if self.frame != frame {
+            *self = Self { frame, ..Self::EMPTY };
         }
+        if self.used == BLOCKS_PER_FRAME || !eligible() {
+            return false;
+        }
+        self.used += 1;
+        true
     }
 }
 
@@ -185,8 +177,17 @@ pub(crate) fn timer() -> Option<Instant> {
     settings().stats.then(Instant::now)
 }
 
-pub(crate) fn protected(at: usize, len: usize, start: Instant) {
-    record(at, 4, &[1, len.div_ceil(4096) as u64, start.elapsed().as_nanos() as u64]);
+pub(crate) fn fault_timer() -> Option<Instant> {
+    let settings = settings();
+    (settings.stats || settings.always_dirty).then(Instant::now)
+}
+
+pub(crate) fn protected(at: usize, len: usize, start: Instant, fault: bool) {
+    let ns = start.elapsed().as_nanos() as u64;
+    if fault {
+        FAULT_PARTS[2].fetch_add(ns, Relaxed);
+    }
+    record(at, 4, &[1, len.div_ceil(4096) as u64, ns]);
 }
 
 pub(crate) struct Fault {
@@ -208,7 +209,7 @@ impl Fault {
 
 impl Drop for Fault {
     fn drop(&mut self) {
-        if let Some(start) = self.started.filter(|_| self.guarded) {
+        if self.guarded && settings().stats && let Some(start) = self.started {
             let ns = start.elapsed().as_nanos() as u64;
             let group = if title_thread(self.code) { 0 } else { 2 };
             record(self.at, group, &[1, ns]);
@@ -288,7 +289,22 @@ fn title_thread(code: usize) -> bool {
         || START.try_with(|&start| in_title(start)).unwrap_or(false)
 }
 
-static POLICY: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static FAULT_PARTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+pub(crate) fn fault_lock(wait: Duration, settle: Duration, work: Duration) {
+    FAULT_PARTS[0].fetch_add(wait.as_nanos() as u64, Relaxed);
+    FAULT_PARTS[1].fetch_add(settle.as_nanos() as u64, Relaxed);
+    FAULT_PARTS[3].fetch_add(1, Relaxed);
+    FAULT_PARTS[5].fetch_add(work.as_nanos() as u64, Relaxed);
+}
+
+pub(crate) fn fast_opened() {
+    if settings().stats {
+        FAULT_PARTS[4].fetch_add(1, Relaxed);
+    }
+}
+
+static POLICY: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 pub(crate) fn deferred(hot: bool) {
     if settings().stats {
@@ -300,6 +316,12 @@ pub(crate) fn copied(bytes: usize) {
     if settings().stats {
         POLICY[2].fetch_add(1, Relaxed);
         POLICY[3].fetch_add(bytes as u64, Relaxed);
+    }
+}
+
+pub(crate) fn descriptor_deferred() {
+    if settings().stats {
+        POLICY[4].fetch_add(1, Relaxed);
     }
 }
 
@@ -370,11 +392,12 @@ pub(crate) fn sample(elapsed: Duration, frames: u64, prepare_us: u64, split: [u6
     let top = top.into_iter().take(10).map(|((at, len), c)| format!(" {at:#x}+{len:#x}[{}]", format(c))).collect::<String>();
     let [watch, flights, steps, card] = sample.split.map(|n| n as f64 / frames / 1e6);
     let refresh = sample.refresh as f64 / frames / 1e6;
-    let [hot, deferred, copies, bytes] = POLICY.each_ref().map(|c| c.swap(0, Relaxed) as f64 / frames);
+    let [hot, deferred, copies, bytes, desc] = POLICY.each_ref().map(|c| c.swap(0, Relaxed) as f64 / frames);
+    let [wait, settle, vp, locked, fast, work] = FAULT_PARTS.each_ref().map(|c| c.swap(0, Relaxed) as f64 / frames);
     tracing::info!(
-        "rf-x5: frames={} fps={:.2} preparing={:.3}ms submit-ms[watch={watch:.3} flights={flights:.3} steps={steps:.3} card={card:.3} refresh={refresh:.3}] faults[count/ms] vp[calls/4K-pages/ms] {} policy[hot-blocks={hot:.1} lazy-blocks={deferred:.1} direct-copies={copies:.1} direct-MB={:.2}] unattributed[{}] top10{}",
+        "rf-x5: frames={} fps={:.2} preparing={:.3}ms submit-ms[watch={watch:.3} flights={flights:.3} steps={steps:.3} card={card:.3} refresh={refresh:.3}] faults[count/ms] vp[calls/4K-pages/ms] {} veh[wait={:.3}ms settle={:.3}ms locked-work={:.3}ms vp={:.3}ms lock-attempts={locked:.1} unlocked={fast:.1}] policy[hot-blocks={hot:.1} lazy-blocks={deferred:.1} direct-copies={copies:.1} direct-MB={:.2} descriptor-deferrals={desc:.1}] unattributed[{}] top10{}",
         sample.frames, frames / sample.elapsed.as_secs_f64(), sample.prepare_us as f64 / frames / 1e3,
-        format(total), bytes / 1e6, format(missing), top,
+        format(total), wait / 1e6, settle / 1e6, work / 1e6, vp / 1e6, bytes / 1e6, format(missing), top,
     );
 }
 
@@ -382,38 +405,43 @@ pub(crate) fn sample(elapsed: Duration, frames: u64, prepare_us: u64, split: [u6
 mod tests {
     use super::*;
 
-    const TEST: Settings = Settings { stats: false, always_dirty: true, lazy_rearm: false,
-        ratio: 0.75, window: 4, quiet: 3, pause: 8 };
+    const TEST: Settings = Settings { stats: false, always_dirty: true, lazy_rearm: false, fast_fault: false,
+        window: 4, fault_ns_per_frame: 100, pause: 8 };
 
     #[test]
-    fn duplicate_faults_and_gaps_in_the_frame_window() {
+    fn expensive_same_frame_faults_qualify() {
         let mut heat = Heat::default();
-        for _ in 0..10 {
-            heat.fault(1, &TEST);
-        }
-        heat.fault(4, &TEST);
-        assert!(!heat.pauses(4));
-        heat.fault(5, &TEST);
-        assert!(!heat.pauses(5));
-        heat.fault(6, &TEST);
-        assert!(heat.pauses(6));
+        heat.fault(1, 350, &TEST);
+        assert!(!heat.pauses(1));
+        heat.fault(1, 50, &TEST);
+        assert!(heat.pauses(1));
     }
 
     #[test]
-    fn quiet_probe_counts_from_rearm_and_retries_on_a_write() {
+    fn cheap_or_outdated_faults_do_not_qualify_and_pause_does_not_feed_itself() {
         let mut heat = Heat::default();
+        heat.fault(0, 350, &TEST);
         for frame in [1, 2, 3, 4] {
-            heat.fault(frame, &TEST);
+            heat.fault(frame, 10, &TEST);
         }
+        assert!(!heat.pauses(4));
+        heat.fault(4, 400, &TEST);
         assert!(heat.pauses(11));
+        heat.fault(11, 500, &TEST);
         assert!(!heat.pauses(12));
-        heat.armed(20, &TEST);
-        heat.fault(22, &TEST);
-        assert!(heat.pauses(29));
-        heat.armed(30, &TEST);
-        heat.fault(33, &TEST);
-        assert!(!heat.pauses(33));
-        assert_eq!(heat.phase, Phase::Track);
+        heat.fault(12, 500, &TEST);
+        assert!(!heat.pauses(12));
+    }
+
+    #[test]
+    fn descriptor_budget_limits_deferrals_per_frame() {
+        let mut budget = DescriptorBudget::EMPTY;
+        assert!(!budget.take(5, || false));
+        for _ in 0..(1 << 20) / crate::watch::PAGE {
+            assert!(budget.take(5, || true));
+        }
+        assert!(!budget.take(5, || panic!("the budget is exhausted")));
+        assert!(budget.take(6, || true));
     }
 
     #[test]

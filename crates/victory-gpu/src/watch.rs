@@ -27,7 +27,7 @@
 //! before.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::{Bound, RangeBounds};
+use std::ops::{Bound, Range, RangeBounds};
 use std::sync::{Condvar, Mutex, RwLock};
 
 use crate::host::rf_x5;
@@ -160,7 +160,7 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     let end = start.checked_add(len)?;
     // Registration only checks whether tracking is possible. Its first
     // consumer will take the bytes and can arm the view then.
-    if len == 0 || writes_inner(start, end, views, !rf_x5::settings().lazy_rearm).is_none() {
+    if len == 0 || writes_inner(start, end, views, !rf_x5::settings().lazy_rearm, 0..0).is_none() {
         return None;
     }
     Some(Tracked {
@@ -888,10 +888,10 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
-    writes_inner(start, end, guarded, true)
+    writes_inner(start, end, guarded, true, 0..0)
 }
 
-fn writes_inner(start: usize, end: usize, guarded: bool, consume: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+fn writes_inner(start: usize, end: usize, guarded: bool, consume: bool, descriptor: Range<usize>) -> Option<(u64, Vec<(usize, u64)>)> {
     use crate::rf_x3::{Check, checked, timer};
     let started = timer();
     // Guarding asks Windows about the pages and protects them: a lazy view
@@ -951,12 +951,8 @@ fn writes_inner(start: usize, end: usize, guarded: bool, consume: bool) -> Optio
             }
             #[cfg(feature = "diagnostics")]
             let guarding = std::time::Instant::now();
-            let written = if consume {
-                guard(first * PAGE, last * PAGE)
-            } else {
-                guard_view(first * PAGE, last * PAGE, false)
-            }
-            .map(|pages| pages.into_iter().map(|p| (p, WHOLE)).collect::<Vec<_>>());
+            let written = guard_view(first * PAGE, last * PAGE, consume, descriptor)
+                .map(|pages| pages.into_iter().map(|p| (p, WHOLE)).collect::<Vec<_>>());
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
@@ -1061,19 +1057,20 @@ fn unpublished_runs(first: usize, last: usize) -> Option<Vec<(usize, usize)>> {
 /// dozen written blocks: one block that was not published made all of it a
 /// kernel asking and a walk of its guards under their lock, which the
 /// submitting thread's own askings wait for.
-pub(crate) fn writes_apart(start: usize, end: usize) -> Option<Vec<(usize, u64)>> {
+fn writes_apart(start: usize, end: usize, descriptor: Range<usize>) -> Option<Vec<(usize, u64)>> {
+    let ask = |from, to| writes_inner(from, to, true, true, descriptor.clone());
     if start >= end || !take_apart() || !light() {
-        return writes(start, end, true).map(|w| w.1);
+        return ask(start, end).map(|w| w.1);
     }
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let Some(runs) = unpublished_runs(first, last) else {
-        return writes(start, end, true).map(|w| w.1);
+        return ask(start, end).map(|w| w.1);
     };
     if runs.len() == 1 && runs[0] == (first, last) {
-        return writes(start, end, true).map(|w| w.1);
+        return ask(start, end).map(|w| w.1);
     }
     for (from, to) in runs {
-        writes((from * PAGE).max(start), (to * PAGE).min(end), true)?;
+        ask((from * PAGE).max(start), (to * PAGE).min(end))?;
     }
     let j = journal();
     Some(j.written.range(first..last).map(|(&p, &w)| (p, w)).collect())
@@ -1177,11 +1174,26 @@ impl Tracked {
     /// Takes changed pages of `[from, to)`, cut to the tracked range. A
     /// partial page stays changed so a later take can read its other bytes.
     pub(crate) fn take(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        self.take_inner(from, to, 0..0)
+    }
+
+    /// Only complete watch blocks which X4 will compare are eligible.
+    pub(crate) fn take_descriptors(&self, to: usize, mirrored_end: usize) -> Vec<(usize, usize)> {
+        let end = mirrored_end.min(to).min(self.end);
+        let descriptor = if rf_x5::settings().always_dirty && end > self.start {
+            self.start.div_ceil(BLOCK)..end / BLOCK
+        } else {
+            0..0
+        };
+        self.take_inner(self.start, to, descriptor)
+    }
+
+    fn take_inner(&self, from: usize, to: usize, descriptor: Range<usize>) -> Vec<(usize, usize)> {
         let (from, to) = (from.max(self.start), to.min(self.end));
         if from >= to {
             return Vec::new();
         }
-        let Some(pages) = writes_apart(from, to) else {
+        let Some(pages) = writes_apart(from, to, descriptor) else {
             return Vec::new();
         };
         let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
@@ -1415,12 +1427,15 @@ pub(crate) fn dirty_pending(from: usize, to: usize) -> bool {
 /// A range that can be taken whole without an OS or journal query. A
 /// rearm/probe that is due goes through the normal guarded read.
 pub(crate) fn dirty_copy(from: usize, to: usize) -> bool {
+    if !rf_x5::settings().lazy_rearm {
+        return false;
+    }
     let (first, last) = (from / BLOCK, to.div_ceil(BLOCK));
     HAVE_DIRTY.load(std::sync::atomic::Ordering::Acquire) && DIRTY.all(first, last) && {
         let g = guards();
-        let (frame, submission) = (rf_x5::frame(), rf_x5::submission());
+        let submission = rf_x5::submission();
         (first..last).all(|block| DIRTY.any(block, block + 1) && !g.protected.contains(block)
-            && g.delays(block, frame, submission))
+            && g.delays_lazy(block, submission))
     }
 }
 
@@ -1488,6 +1503,7 @@ struct Opened {
     hot: Option<std::time::Duration>,
     frame: u64,
     submission: u64,
+    fault_ns: u64,
     wrote: bool,
 }
 
@@ -1536,17 +1552,20 @@ static FAULTS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::A
 /// under the lock, as before, with nothing changed here but what that does
 /// again (another thread is opening it, every view is to be opened, or its
 /// protection could not be changed).
-fn open_unlocked(block: usize) -> bool {
+fn open_unlocked(block: usize, started: Option<std::time::Instant>, only_single: bool) -> bool {
     use std::sync::atomic::Ordering::{Relaxed, SeqCst};
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
     #[cfg(feature = "diagnostics")]
     let began = std::time::Instant::now();
     if OPENING.swap_on(block) {
         return false;
     }
+    if !PROTECTED.any(block, block + 1) {
+        OPENING.clear(block);
+        return false;
+    }
     // (Looked at after the bit above is set: see `ALIASED`.)
     let others: Vec<usize> = if ALIASED.any(block, block + 1) {
-        if !open_one_view() {
+        if only_single || !open_one_view() {
             // Nothing done yet: as if the bit had never been set.
             OPENING.clear(block);
             return false;
@@ -1569,15 +1588,11 @@ fn open_unlocked(block: usize) -> bool {
     PUBLISHED.clear(block);
     put_count(block).store(0, Relaxed);
     let at = std::time::Instant::now();
-    let mut old = 0;
-    // SAFETY: a block we made read-only.
-    let mut done = unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) } != 0;
-    if done && !matches!(old, PAGE_READONLY | PAGE_READWRITE) {
-        // Not what we left there (as in `unguard`): other memory's, which
-        // keeps its protection.
-        // SAFETY: as above.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut old) };
-        done = false;
+    let done = make_writable(block, true);
+    if done && only_single {
+        // The OS change is complete. OPENING still prevents rearm until the
+        // guard notes are settled, while followers can stop spinning.
+        PROTECTED.clear(block);
     }
     #[cfg(feature = "diagnostics")]
     let told = others.len();
@@ -1585,7 +1600,8 @@ fn open_unlocked(block: usize) -> bool {
     {
         let mut opened = OPENED.lock().unwrap_or_else(|e| e.into_inner());
         opened.push(Opened {
-            block, at, others, hot: hot(), frame: rf_x5::frame(), submission: rf_x5::submission(), wrote: done,
+            block, at, others, hot: hot(), frame: rf_x5::frame(), submission: rf_x5::submission(),
+            fault_ns: started.map_or(0, |t| t.elapsed().as_nanos() as u64), wrote: done,
         });
         TO_SETTLE.store(opened.len(), SeqCst);
     }
@@ -1611,12 +1627,13 @@ fn settle(g: &mut Guards) {
     if TO_SETTLE.load(SeqCst) == 0 {
         return;
     }
-    let opened = {
+    let mut batch = std::mem::take(&mut g.opened_batch);
+    {
         let mut opened = OPENED.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::swap(&mut batch, &mut *opened);
         TO_SETTLE.store(0, SeqCst);
-        std::mem::take(&mut *opened)
-    };
-    for Opened { block, at, mut others, hot, frame, submission, wrote } in opened {
+    }
+    for Opened { block, at, mut others, hot, frame, submission, fault_ns, wrote } in batch.drain(..) {
         if g.aliased.contains(block) {
             if others.is_empty() {
                 // Guarded with its other views after the fault looked: they
@@ -1628,20 +1645,22 @@ fn settle(g: &mut Guards) {
                     .filter(|&other| other != block)
                     .collect();
             }
-            g.unalias(block);
+            if wrote {
+                g.unalias(block);
+            }
         }
         for &other in &others {
             g.clean.remove(other);
             PUBLISHED.clear(other);
         }
-        if g.protected.remove(block) {
-            g.clean.remove(block);
-            PUBLISHED.clear(block);
+        g.clean.remove(block);
+        PUBLISHED.clear(block);
+        if wrote && g.protected.remove(block) {
             PROTECTED.clear(block);
         }
-        g.opened_at(block, at, hot);
         if wrote {
-            g.record_fault(block, frame, submission);
+            g.opened_at(block, at, hot);
+            g.record_fault(block, frame, submission, fault_ns);
         }
         // (Another fault may have told the same views: they are not clean
         // now, and its own block keeps them so, `protect_alias`.)
@@ -1650,6 +1669,7 @@ fn settle(g: &mut Guards) {
         }
         OPENING.clear(block);
     }
+    g.opened_batch = batch;
 }
 
 /// Whether a block of `[first, last)` is being opened by a fault without the
@@ -1742,9 +1762,6 @@ fn publish(pages: &[usize]) {
     for &page in pages {
         if (g.clean.contains(page) || g.held.contains(page)) && !unsettled(page, page + 1) {
             if deferred(page, page + 1) {
-                if g.clean.contains(page) && let Some(history) = g.x5.get_mut(&page) {
-                    history.heat.armed(rf_x5::frame(), rf_x5::settings());
-                }
                 DIRTY.clear(page);
             }
             if !light {
@@ -2132,8 +2149,10 @@ struct Guards {
     /// Blocks opened by a write fault, when ([`rest`]), and how long they
     /// rest for being written again and again ([`hot`]; zero if not).
     opened: std::collections::HashMap<usize, (std::time::Instant, std::time::Duration), std::hash::BuildHasherDefault<PageHash>>,
+    opened_batch: Vec<Opened>,
     x5: BTreeMap<usize, GuardHistory>,
     x5_pruned: Option<u64>,
+    descriptor_budget: rf_x5::DescriptorBudget,
 }
 
 #[derive(Default)]
@@ -2143,7 +2162,7 @@ struct GuardHistory {
 }
 
 impl Guards {
-    fn record_fault(&mut self, block: usize, frame: u64, submission: u64) {
+    fn record_fault(&mut self, block: usize, frame: u64, submission: u64, ns: u64) {
         let settings = rf_x5::settings();
         if !(settings.always_dirty || settings.lazy_rearm) || !view_guard() {
             return;
@@ -2161,15 +2180,15 @@ impl Guards {
         }
         let history = self.x5.entry(block).or_default();
         if settings.always_dirty {
-            history.heat.fault(frame, settings);
+            history.heat.fault(frame, ns, settings);
         }
         if settings.lazy_rearm {
             history.submission = submission;
         }
     }
 
-    fn delays(&self, block: usize, frame: u64, submission: u64) -> bool {
-        self.x5.get(&block).is_some_and(|h| h.heat.pauses(frame) || submission != 0 && h.submission == submission)
+    fn delays_lazy(&self, block: usize, submission: u64) -> bool {
+        submission != 0 && self.x5.get(&block).is_some_and(|h| h.submission == submission)
     }
 
     fn left_alone(&self, block: usize) -> bool {
@@ -2231,21 +2250,27 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     changing: Vec::new(),
     aliased: Blocks::new(),
     opened: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+    opened_batch: Vec::new(),
     x5: BTreeMap::new(),
     x5_pruned: None,
+    descriptor_budget: rf_x5::DescriptorBudget::EMPTY,
 });
 
 /// The guards' lock, with what faults opened without it settled first
 /// ([`settle`]).
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    let mut g = match GUARDS.try_lock() {
+    let mut g = lock_guards();
+    settle(&mut g);
+    g
+}
+
+fn lock_guards() -> std::sync::MutexGuard<'static, Guards> {
+    match GUARDS.try_lock() {
         Ok(g) => g,
         // (Held by this, whoever panicked with it: not to be asked for again.)
         Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => waited(3, || GUARDS.lock().unwrap_or_else(|e| e.into_inner())),
-    };
-    settle(&mut g);
-    g
+    }
 }
 
 /// The 4 KiB pages of title memory that what shaders wrote was put into,
@@ -2449,11 +2474,12 @@ pub(crate) fn written_since_taken(at: usize, len: usize) -> bool {
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
+#[cfg(test)]
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
-    guard_view(start, end, true)
+    guard_view(start, end, true, 0..0)
 }
 
-fn guard_view(start: usize, end: usize, consume: bool) -> Option<Vec<usize>> {
+fn guard_view(start: usize, end: usize, consume: bool, descriptor: Range<usize>) -> Option<Vec<usize>> {
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
@@ -2563,21 +2589,30 @@ fn guard_view(start: usize, end: usize, consume: bool) -> Option<Vec<usize>> {
             if cover(&mut g, block, block + 1) {
                 g.clean.insert(block);
             }
-        } else if delay && g.delays(block, frame, submission)
-            && view_guard() && crate::inplace::single_title_view(block * BLOCK)
-        {
-            if !DIRTY.swap_on(block) {
-                HAVE_DIRTY.store(true, std::sync::atomic::Ordering::Release);
-                rf_x5::deferred(g.x5.get(&block).is_some_and(|h| h.heat.pauses(frame)));
+        } else {
+            let can_arm = !g.foreign.contains(&block) && !g.left_alone(block) && !g.rests(block, rest);
+            let at = block * BLOCK;
+            let hot = can_arm && descriptor.contains(&block) && g.x5.get(&block).is_some_and(|h| h.heat.pauses(frame));
+            let lazy = settings.lazy_rearm && g.delays_lazy(block, submission);
+            let eligible = (hot || lazy) && view_guard() && crate::inplace::single_title_view(at);
+            let hot = eligible && hot
+                && g.descriptor_budget.take(frame, || crate::shadow::descriptor_only(at as u64, (at + BLOCK) as u64));
+            if hot || eligible && lazy {
+                if !DIRTY.swap_on(block) {
+                    HAVE_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+                    rf_x5::deferred(hot);
+                }
+                if hot {
+                    rf_x5::descriptor_deferred();
+                }
+            } else if can_arm {
+                let finished = rf_x5::push_block(&mut run, block);
+                debug_assert!(finished.is_none(), "a preceding run was already flushed at the gap");
+                continue;
             }
             if let Some((from, to)) = run.take() {
                 protect(&mut g, from, to);
             }
-        } else if !g.foreign.contains(&block) && !g.left_alone(block) && !g.rests(block, rest) {
-            let finished = rf_x5::push_block(&mut run, block);
-            debug_assert!(finished.is_none(), "a preceding run was already flushed at the gap");
-        } else if let Some((from, to)) = run.take() {
-            protect(&mut g, from, to);
         }
     }
     if let Some((from, to)) = run {
@@ -2707,7 +2742,7 @@ fn protect_alias(g: &mut Guards, block: usize) -> bool {
         return true;
     }
     if g.left_alone(block)
-        || deferred(block, block + 1) && g.delays(block, rf_x5::frame(), rf_x5::submission())
+        || deferred(block, block + 1) && g.delays_lazy(block, rf_x5::submission())
     {
         return false;
     }
@@ -2852,9 +2887,20 @@ fn uncommitted_end(block: usize) -> usize {
 /// clean no longer, whether they are opened as well ([`open_one_view`]) or
 /// not.
 fn open(g: &mut Guards, start: usize, end: usize) -> usize {
+    open_range(g, start, end, false)
+}
+
+fn open_range(g: &mut Guards, start: usize, end: usize, fault: bool) -> usize {
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     if first >= last {
         return 0;
+    }
+    if first + 1 == last && !g.aliased.contains(first) {
+        if !g.protected.contains(first) {
+            return 0;
+        }
+        unguard_blocks(g, &[first], fault);
+        return 1;
     }
     let mut blocks: Vec<usize> = g.protected.range(first..last).collect();
     let here = blocks.len();
@@ -2880,13 +2926,16 @@ fn open(g: &mut Guards, start: usize, end: usize) -> usize {
         #[cfg(feature = "diagnostics")]
         ALIASES[1].fetch_add((blocks.len() - here) as u64, std::sync::atomic::Ordering::Relaxed);
     }
-    unguard(g, &blocks);
+    unguard_blocks(g, &blocks, fault);
     here
 }
 
 /// Gives write access back to `blocks`, guarded ones.
 fn unguard(g: &mut Guards, blocks: &[usize]) {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
+    unguard_blocks(g, blocks, false);
+}
+
+fn unguard_blocks(g: &mut Guards, blocks: &[usize], fault: bool) {
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // All of them before the first can be written: a write through one is a
@@ -2897,17 +2946,7 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
         PUBLISHED.clear(block);
     }
     for &block in blocks {
-        let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe {
-            if VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0
-                && !matches!(old, PAGE_READONLY | PAGE_READWRITE)
-            {
-                // Not what we left there: the address is other memory's
-                // (code's, say), which keeps its protection.
-                VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut old);
-            }
-        }
+        make_writable(block, fault);
         PROTECTED.clear(block);
         bump_write_blocks(block, block + 1);
     }
@@ -2917,15 +2956,38 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
     }
 }
 
+fn make_writable(block: usize, fault: bool) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
+    let mut old = 0;
+    let at = (block * BLOCK) as *const _;
+    // SAFETY: a block we made read-only.
+    unsafe {
+        if protect_timed(at, BLOCK, PAGE_READWRITE, &mut old, fault) == 0 {
+            return false;
+        }
+        if !matches!(old, PAGE_READONLY | PAGE_READWRITE) {
+            // The address now has someone else's protection. Restore it.
+            protect_timed(at, BLOCK, old, &mut old, fault);
+            return false;
+        }
+    }
+    true
+}
+
 /// The watch's protection calls, including failure and restoration.
 /// Safety is the same as Windows' VirtualProtect.
 #[allow(non_snake_case)]
 unsafe fn VirtualProtect(at: *const std::ffi::c_void, len: usize, protect: u32, old: *mut u32) -> i32 {
+    // SAFETY: same contract as the underlying call.
+    unsafe { protect_timed(at, len, protect, old, false) }
+}
+
+unsafe fn protect_timed(at: *const std::ffi::c_void, len: usize, protect: u32, old: *mut u32, fault: bool) -> i32 {
     let started = rf_x5::timer();
     // SAFETY: the caller supplies the mapping and writable out pointer.
     let result = unsafe { windows_sys::Win32::System::Memory::VirtualProtect(at, len, protect, old) };
     if let Some(started) = started {
-        rf_x5::protected(at as usize, len, started);
+        rf_x5::protected(at as usize, len, started, fault);
     }
     result
 }
@@ -3615,7 +3677,7 @@ pub(crate) fn install() {
         EXCEPTION_POINTERS,
     };
     unsafe extern "system" fn on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
-        let started = rf_x5::timer();
+        let started = rf_x5::fault_timer();
         let _fault = crate::timeline::span("a fault looked at");
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
@@ -3671,18 +3733,27 @@ pub(crate) fn install() {
         }
         let at = r.ExceptionInformation[1];
         let block = at / BLOCK;
+        let guarded = PROTECTED.any(block, block + 1);
         let mut x5_fault = rf_x5::Fault::new(
-            started, at, r.ExceptionAddress as usize, started.is_some() && PROTECTED.any(block, block + 1),
+            started, at, r.ExceptionAddress as usize, guarded,
         );
-        if ours.is_none()
-            && PROTECTED.any(block, block + 1)
+        if ours.is_none() && guarded
             // SAFETY: the context the system passes, to go on from.
             && crate::titlewrite::store(unsafe { &mut *context }, at)
         {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
-        if unlocked() && PROTECTED.any(block, block + 1) {
-            if open_unlocked(block) {
+        if guarded {
+            let legacy = unlocked();
+            // X5 takes the existing bit-based opening path for a single view.
+            // A concurrent remap or a known alias uses the locked path.
+            let mapping = (rf_x5::settings().fast_fault && !legacy && !ALIASED.any(block, block + 1))
+                .then(|| MAPPING.try_read().ok()).flatten();
+            let attempted = legacy || mapping.is_some();
+            let fast = attempted && open_unlocked(block, started, !legacy);
+            drop(mapping);
+            if fast {
+                rf_x5::fast_opened();
                 x5_fault.handled();
                 #[cfg(feature = "diagnostics")]
                 {
@@ -3693,19 +3764,27 @@ pub(crate) fn install() {
             }
             // Another thread is opening it so: writable in a few
             // microseconds, with no lock waited for.
-            let began = std::time::Instant::now();
-            while OPENING.any(block, block + 1) && began.elapsed().as_micros() < 100 {
+            if attempted && OPENING.any(block, block + 1) {
+                let began = std::time::Instant::now();
+                // Wait on the in-process bit, then query once. Querying the
+                // VM during every spin contends with the protection change.
+                while !legacy && OPENING.any(block, block + 1) && PROTECTED.any(block, block + 1)
+                    && began.elapsed().as_micros() < 100
+                {
+                    for _ in 0..64 {
+                        std::hint::spin_loop();
+                    }
+                }
                 if writable(at) {
                     #[cfg(feature = "diagnostics")]
                     crate::faultbook::note(crate::faultbook::What::Open, block, began.elapsed().as_nanos() as usize, 0);
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }
-                for _ in 0..64 {
-                    std::hint::spin_loop();
-                }
             }
             #[cfg(feature = "diagnostics")]
-            FAULTS[5].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if attempted {
+                FAULTS[5].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         // Another thread may have opened the block since this one faulted
         // (then nothing waits for the lock), and a copy may have guarded it
@@ -3721,14 +3800,23 @@ pub(crate) fn install() {
             let began = std::time::Instant::now();
             // (Let go again before the next look: the runtime wants the
             // guards to end a change.)
-            let mut g = guards();
+            let lock = rf_x5::timer();
+            let mut g = lock_guards();
             #[cfg(feature = "diagnostics")]
             let waited = began.elapsed();
-            let opened = open(&mut g, at, at + 1);
+            let acquired = lock.map(|_| std::time::Instant::now());
+            settle(&mut g);
+            let settled = lock.map(|_| std::time::Instant::now());
+            let opened = open_range(&mut g, at, at + 1, true);
             if opened != 0 {
                 g.opened(block);
-                g.record_fault(block, rf_x5::frame(), rf_x5::submission());
-                drop(g);
+                g.record_fault(block, rf_x5::frame(), rf_x5::submission(), started.map_or(0, |t| t.elapsed().as_nanos() as u64));
+            }
+            drop(g);
+            if (guarded || opened != 0) && let (Some(lock), Some(acquired), Some(settled)) = (lock, acquired, settled) {
+                rf_x5::fault_lock(acquired.duration_since(lock), settled.duration_since(acquired), settled.elapsed());
+            }
+            if opened != 0 {
                 x5_fault.handled();
                 #[cfg(feature = "diagnostics")]
                 {
@@ -3757,6 +3845,11 @@ pub(crate) fn install() {
     // SAFETY: the handler only touches our guard state and protections.
     ONCE.call_once(|| unsafe {
         rf_x5::init_stats();
+        if rf_x5::settings().fast_fault || unlocked() {
+            let mut g = lock_guards();
+            g.opened_batch.reserve(64);
+            OPENED.lock().unwrap_or_else(|e| e.into_inner()).reserve(64);
+        }
         AddVectoredExceptionHandler(1, Some(on_write));
     });
 }
@@ -5340,7 +5433,7 @@ mod tests {
             let mut opened = OPENED.lock().unwrap();
             opened.push(Opened {
                 block: block(two), at: std::time::Instant::now(), others: vec![block(one)], hot: None,
-                frame: 0, submission: 0, wrote: false,
+                frame: 0, submission: 0, fault_ns: 0, wrote: true,
             });
             TO_SETTLE.store(opened.len(), SeqCst);
         }
