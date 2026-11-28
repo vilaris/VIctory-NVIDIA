@@ -23,8 +23,14 @@ pub(super) fn speculative_rounds(gate: bool, late: bool) -> bool {
     !(gate && late)
 }
 
-fn needs_round(stride_or_lent: bool, indexed_heaps: u8) -> bool {
-    stride_or_lent || indexed_heaps != 0
+const VIEWS: u8 = 1;
+const SAMPLERS: u8 = 2;
+const BOTH: u8 = VIEWS | SAMPLERS;
+
+fn emitted_heaps(features: Option<u64>, strides: bool) -> u8 {
+    let Some(bits) = features else { return BOTH };
+    (u8::from(strides || bits & 0x200_0000 != 0) * VIEWS)
+        | (u8::from(bits & 0x400_0000 != 0) * SAMPLERS)
 }
 
 /// Equal ranges are common even on dirty pages. Split unequal ranges into
@@ -105,13 +111,13 @@ impl Sample {
 
 #[cfg(windows)]
 mod runtime {
-    use super::{Sample, needs_round, speculative_rounds};
+    use super::{BOTH, SAMPLERS, Sample, VIEWS, emitted_heaps, speculative_rounds};
     use crate::host::HostList;
-    use crate::pipeline::{Shader, Translated};
+    use crate::object::This;
+    use crate::pipeline::{Shader, Translated, host::HostPipeline};
     use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant};
     use victory_shader::emit::{SLOT_STRIDES, SLOT_TABLE_STRIDES};
-    use victory_shader::native::{HwStage, ResourceType, RootType};
 
     const STATS: u8 = 1;
     const PICK_GATE: u8 = 2;
@@ -153,31 +159,24 @@ mod runtime {
         switches() != 0
     }
 
-    const VIEWS: u8 = 1;
-    const SAMPLERS: u8 = 2;
-    const BOTH: u8 = VIEWS | SAMPLERS;
-
     /// Mark the actual heaps bound at this operation, retaining the list bit
     /// across thread handoffs, delayed waits and additional submissions.
-    fn note(list: &HostList, bound: [usize; 2], mask: u8, stride_or_lent: bool) {
-        if switches() & (PICK_GATE | PICKED) != 0 && needs_round(stride_or_lent, mask) {
-            crate::heap_marks::note_pick(list);
-        }
+    fn note(list: &HostList, bound: [usize; 2], mask: u8, shader: &Shader, pso: &HostPipeline, title: This) {
         if mask == 0 {
             return;
+        }
+        if switches() & (PICK_GATE | PICKED) != 0 {
+            crate::heap_marks::note_pick(list);
         }
         for at in bound.into_iter().filter(|&at| at != 0) {
             let heap = crate::descriptor::heap(at as crate::object::This);
             let bit = if heap.samplers() { SAMPLERS } else { VIEWS };
             if mask & bit != 0 {
+                if verify() {
+                    heap.note_verify_reader(shader, pso, title);
+                }
                 heap.note_indexed();
             }
-        }
-    }
-
-    pub(crate) fn note_lent(list: &HostList, bound: [usize; 2]) {
-        if note_enabled() {
-            note(list, bound, BOTH, true);
         }
     }
 
@@ -187,14 +186,14 @@ mod runtime {
         static PROOFS: std::cell::RefCell<std::collections::HashMap<usize, u8>> = Default::default();
     }
 
-    pub(crate) fn note_shader(list: &HostList, bound: [usize; 2], shader: &Shader, t: &Translated, missing_table: bool) {
+    pub(crate) fn note_shader(list: &HostList, bound: [usize; 2], shader: &Shader, t: &Translated, pso: &HostPipeline, title: This, uncertain: bool) {
         let mask = PROOFS.with_borrow_mut(|proofs| {
-            *proofs.entry(std::ptr::from_ref(shader) as usize).or_insert_with(|| reachable(shader, t))
+            *proofs.entry(std::ptr::from_ref(shader) as usize).or_insert_with(|| reachable(t))
         });
-        note(list, bound, if missing_table { BOTH } else { mask }, t.host.root_srvs.contains(&SLOT_TABLE_STRIDES));
+        note(list, bound, if uncertain { BOTH } else { mask }, shader, pso, title);
     }
 
-    fn reachable(shader: &Shader, t: &Translated) -> u8 {
+    fn reachable(t: &Translated) -> u8 {
         use victory_shader::{Container, FourCC};
         // The emitter sets these SFI0 features whenever it emits a heap
         // handle. They cover images and samplers without a stride root SRV.
@@ -202,81 +201,11 @@ mod runtime {
             let bytes = c.part(FourCC::SFI0)?.data.get(..8)?.try_into().ok()?;
             Some(u64::from_le_bytes(bytes))
         });
-        let Some(bits) = features else {
-            return BOTH;
-        };
-        let mut mask = (u8::from(bits & 0x200_0000 != 0) * VIEWS) | (u8::from(bits & 0x400_0000 != 0) * SAMPLERS);
-        if t.host.root_srvs.contains(&SLOT_STRIDES) {
-            mask |= VIEWS;
-        }
-        if mask == 0 {
-            return 0;
-        }
-        let Some(programs) = shader.programs() else {
-            return mask;
-        };
-        let mut analyzed = false;
-        let mut heap = 0;
-        for p in programs.iter().filter(|p| p.stage == t.host.stage) {
-            analyzed = true;
-            if !matches!(p.stage, HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms) {
-                return mask;
-            }
-            let Some(reads) = indexed_sources(p, t, mask) else {
-                return mask;
-            };
-            heap |= reads;
-        }
-        if !analyzed {
-            return mask;
-        }
-        if t.host.root_srvs.contains(&SLOT_STRIDES) {
-            heap |= VIEWS;
-        }
-        heap
-    }
-
-    fn indexed_sources(p: &victory_shader::NativeProgram, t: &Translated, mask: u8) -> Option<u8> {
-        use victory_shader::resource::{Role, Source};
-        let program = victory_shader::spill::build(p).ok()?;
-        // Unknown per-lane/control-flow provenance keeps the full interval.
-        let trace = victory_shader::resource::track(&program, &p.layout, p.stage, None).ok()?;
-        let mut indexed = 0;
-        let mut static_tables = 0;
-        for desc in &trace.descriptors {
-            let bit = if desc.role == Role::Sampler { SAMPLERS } else { VIEWS };
-            if mask & bit == 0 || indexed & bit != 0 {
-                continue;
-            }
-            for src in desc.source.leaves() {
-                let (load, first) = match *src {
-                    Source::Loaded { load, first } => (load, first),
-                    Source::Constant(_) | Source::Built { .. } => continue,
-                    _ => {
-                        indexed |= bit;
-                        break;
-                    }
-                };
-                let address = trace.scalar.iter().find(|(site, _)| *site == load)?.1;
-                let root = p.layout.get(address.param)?;
-                let dword = address.offset.wrapping_add(4 * u32::from(first)) / 4;
-                let step_dwords = if bit == SAMPLERS { 4 } else { 8 };
-                let aligned = dword % step_dwords == 0;
-                let table = aligned && root.root == RootType::Table && address.dynamic.is_none()
-                    && t.used.iter().any(|u| {
-                        u.root == RootType::Table && u.slot == root.slot && u.table_offset_dwords == dword
-                            && (u.kind == ResourceType::Sampler) == (bit == SAMPLERS)
-                    });
-                if !table {
-                    indexed |= bit;
-                    break;
-                }
-                static_tables |= bit;
-            }
-        }
-        // A kind that emits heap handles without a corresponding static
-        // table in the trace is unknown, even when the trace succeeded.
-        Some(indexed | (mask & !static_tables))
+        // Static guest provenance only identifies a root and an offset.
+        // The emitted handle can still refer to the mutable title heap
+        // when a table is direct or the snapshot is unavailable.
+        let strides = t.host.root_srvs.iter().any(|slot| matches!(*slot, SLOT_STRIDES | SLOT_TABLE_STRIDES));
+        emitted_heaps(features, strides)
     }
 
     struct Window {
@@ -321,7 +250,7 @@ mod runtime {
 }
 
 #[cfg(windows)]
-pub(crate) use runtime::{late_lane, note_enabled, note_lent, note_shader, picked, speculative, stats, verify};
+pub(crate) use runtime::{late_lane, note_enabled, note_shader, picked, speculative, stats, verify};
 #[cfg(windows)]
 pub(super) use runtime::{line, record};
 
@@ -335,9 +264,16 @@ mod tests {
         assert!(speculative_rounds(false, true));
         assert!(speculative_rounds(true, false));
         assert!(!speculative_rounds(true, true));
-        assert!(!needs_round(false, 0));
-        assert!(needs_round(true, 0));
-        assert!(needs_round(false, 1));
+    }
+
+    #[test]
+    fn emitted_heap_handles_keep_coverage_even_if_guest_sources_are_static() {
+        assert_eq!(emitted_heaps(None, false), BOTH);
+        assert_eq!(emitted_heaps(Some(0), false), 0);
+        assert_eq!(emitted_heaps(Some(0), true), VIEWS);
+        assert_eq!(emitted_heaps(Some(0x200_0000), false), VIEWS);
+        assert_eq!(emitted_heaps(Some(0x400_0000), false), SAMPLERS);
+        assert_eq!(emitted_heaps(Some(0x400_0000), true), BOTH);
     }
 
     #[test]

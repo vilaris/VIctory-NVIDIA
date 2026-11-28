@@ -462,6 +462,22 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+#[cfg(windows)]
+#[path = "rf_x6.rs"]
+pub(crate) mod rf_x6;
+
+#[cfg(windows)]
+impl Shader {
+    pub(crate) fn diagnostic_name(&self) -> String {
+        rf_x6::entry_name(&self.container).map_or_else(|| self.stage.to_owned(), str::to_owned)
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn diagnostic_key<'a>(this: This) -> Option<&'a str> {
+    (!this.is_null()).then(|| pipeline(this).host.key())
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {

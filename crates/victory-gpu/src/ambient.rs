@@ -135,7 +135,20 @@ fn set() -> Set {
 /// Whether a stand-in is on (for the diffuse light or for reflections):
 /// set, and the title's rays find nothing.
 pub(crate) fn on() -> bool {
-    (set() != Set::Off || specular().is_some()) && !crate::pipeline::builder_runs()
+    (set() != Set::Off || specular().is_some() || rt_fallback()) && !crate::pipeline::builder_runs()
+}
+
+/// Replace resolved diffuse light when tracing is disabled. Work on the
+/// known final output instead of clearing intermediate UAVs shared with
+/// screen-space hits and temporal passes.
+pub(crate) fn rt_fallback() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_RF_X6_RT_FALLBACK").is_some_and(|v| v == "1")
+            && !std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")
+            && (std::env::var_os("VICTORY_RT_RESOLVE").is_none_or(|v| v == "0")
+                || std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0"))
+    })
 }
 
 /// `VICTORY_AMBIENT_SPECULAR=<share>[,<sky>]`: reflections whose rays found
@@ -460,7 +473,8 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
-    float3 was = unpack(light[p]);
+    // A negative upper bound requests replacement by the current estimate.
+    float3 was = most < 0.0 ? float3(0.0, 0.0, 0.0) : unpack(light[p]);
     // Magenta/violet garbage the probes' memory held (green far under red and
     // blue): dropped, as VIctory-Belobug-AMD does (ambient.rs, "Filter magenta
     // garbage probes"). Seen on an RTX 5080 as a purple-blue glow on a lit
@@ -472,7 +486,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
     if (was.b > 2.5 * was.g && was.b > was.r && was.b > 0.02) was = 0.0;
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
-    float top = max(dot(found, LUMA) * most, 1e-6);
+    float top = max(dot(found, LUMA) * abs(most), 1e-6);
     float has = dot(was, LUMA);
     was *= min(1.0, top / max(has, 1e-6));
     float3 now = max(was, found);
@@ -685,16 +699,25 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     };
     // The share of the estimate, and the constant (for reflections: the
     // share of the title's sky kept); the keep runs for either stand-in.
-    let (level, constant) = match (role, set(), specular()) {
+    let fallback = rt_fallback();
+    let replace = fallback && role == Role::Resolve;
+    let mode = if fallback && set() == Set::Off && matches!(role, Role::Radiance | Role::Resolve) {
+        Set::Estimate(0.8)
+    } else {
+        set()
+    };
+    let kept = KEPT.load(Ordering::Relaxed);
+    let (level, constant) = match (role, mode, specular()) {
         (Role::Miss, _, Some(s)) => (s.share, s.sky),
         (Role::Miss, _, None) => return false,
         (Role::Radiance, Set::Off, Some(_)) => (0.0, 0.0),
         (_, Set::Off, _) => return false,
+        (Role::Resolve, Set::Estimate(_), _) if replace && !kept => (0.0, 0.02),
         (_, Set::Estimate(level), _) => (level, 0.0f32),
         (_, Set::Constant(level), _) => (0.0, level),
     };
     let estimate = role == Role::Miss || constant == 0.0;
-    if role != Role::Radiance && estimate && !KEPT.load(Ordering::Relaxed) {
+    if role != Role::Radiance && estimate && !kept {
         if role == Role::Miss {
             note_miss(MissNote::NotReady);
         }
@@ -722,9 +745,9 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[6] = views.depth_size[0];
     words[7] = views.depth_size[1];
     words[8] = 0.04f32.to_bits();
-    words[9] = 4.0f32.to_bits();
+    words[9] = (if replace { -4.0f32 } else { 4.0f32 }).to_bits();
     words[10] = air().to_bits();
-    words[11] = if once() { 1.0f32 } else { 0.0 }.to_bits();
+    words[11] = if once() || replace || (fallback && role == Role::Radiance) { 1.0f32 } else { 0.0 }.to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -756,7 +779,8 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                     run("ambient: place", &pass.place, 8, 9, 1);
                     run("ambient: gather", &pass.gather, 20, 45, 1);
                 }
-                run("ambient: raise", &pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+                let name = if replace { "ambient: rt fallback" } else { "ambient: raise" };
+                run(name, &pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
             }
             Role::Miss => {
                 // The points afresh, from this frame's depth: the diffuse

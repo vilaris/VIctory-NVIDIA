@@ -127,7 +127,19 @@ pub(crate) struct Heap {
     #[cfg(windows)]
     picked_ready: std::sync::OnceLock<()>,
     #[cfg(windows)]
+    recorded_sync: std::sync::Mutex<[Option<u64>; 2]>,
+    #[cfg(windows)]
+    verify_readers: std::sync::Mutex<Vec<VerifyReader>>,
+    #[cfg(windows)]
+    verify_tables: std::sync::Mutex<std::collections::HashMap<u32, (String, String, String)>>,
+    #[cfg(windows)]
     verify_state: std::sync::OnceLock<std::sync::Mutex<VerifyHeap>>,
+}
+
+#[cfg(windows)]
+pub(crate) enum HeapPass {
+    Buffers,
+    EarlyTextures,
 }
 
 pub(crate) fn heap<'a>(this: This) -> &'a Heap {
@@ -136,6 +148,63 @@ pub(crate) fn heap<'a>(this: This) -> &'a Heap {
 }
 
 impl Heap {
+    /// The queue's round happens after recording. The record-time heap
+    /// sweeps need to discover copied descriptors before taking their
+    /// buffer set or texture queue, even if no earlier list was submitted.
+    #[cfg(windows)]
+    pub(crate) fn sync_before_heap_pass(&self, frame: u64, pass: HeapPass) {
+        if self.written.is_none() || !sync_on() || !rf_x4::late_lane()
+            || (!rf_x4::picked() && rf_x4::speculative())
+        {
+            return;
+        }
+        self.indexed.store(true, std::sync::atomic::Ordering::Release);
+        let mut stamps = self.recorded_sync.lock().unwrap_or_else(|e| e.into_inner());
+        let synced = &mut stamps[pass as usize];
+        if synced.is_none_or(|previous| previous < frame) {
+            drop(begin_sync_heaps());
+            *synced = Some(frame);
+        }
+    }
+
+    #[cfg(windows)]
+    fn note_verify_reader(&self, shader: &crate::pipeline::Shader, pso: &crate::pipeline::host::HostPipeline, title: This) {
+        if self.written.is_none() {
+            return;
+        }
+        use windows::core::Interface;
+        let id = pso.pso.as_raw() as usize;
+        let pso_key = crate::pipeline::diagnostic_key(title).unwrap_or("-");
+        let mut readers = self.verify_readers.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = readers.iter().position(|r| r.host == id && r.pso == pso_key && r.hash == shader.hash) {
+            readers[..=i].rotate_right(1);
+            return;
+        }
+        readers.insert(0, VerifyReader {
+            host: id,
+            pso: pso_key.to_owned(),
+            hash: shader.hash.clone(),
+            shader: shader.diagnostic_name(),
+        });
+        readers.truncate(16);
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn note_verify_table(&self, slot: u32, shader: &crate::pipeline::Shader, title: This) {
+        if self.written.is_none() || !rf_x4::verify() {
+            return;
+        }
+        let pso = crate::pipeline::diagnostic_key(title).unwrap_or("-");
+        let mut tables = self.verify_tables.lock().unwrap_or_else(|e| e.into_inner());
+        if tables.get(&slot).is_some_and(|(old_pso, hash, _)| old_pso == pso && hash == &shader.hash) {
+            return;
+        }
+        if tables.len() >= 8192 {
+            tables.clear();
+        }
+        tables.insert(slot, (pso.to_owned(), shader.hash.clone(), shader.diagnostic_name()));
+    }
+
     #[cfg(windows)]
     fn note_indexed(&self) {
         use std::sync::atomic::Ordering::{Acquire, Release};
@@ -469,6 +538,11 @@ pub(crate) fn sync_heaps() {
     if !sync_on() {
         return;
     }
+    // When the worker is disabled, recording and submission can both ask
+    // for a round. Keep the write-watch cursor and publication in order.
+    static DIRECT_ROUND: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _direct = (rf_x4::picked() || !rf_x4::speculative())
+        .then(|| DIRECT_ROUND.lock().unwrap_or_else(|e| e.into_inner()));
     let started = std::time::Instant::now();
     let x4_stats = rf_x4::stats();
     let x4_blocks = rf_x4::picked();
@@ -839,6 +913,14 @@ struct VerifyHeap {
     pending: std::collections::BTreeMap<u32, [u32; 3]>,
 }
 
+#[cfg(windows)]
+struct VerifyReader {
+    host: usize,
+    pso: String,
+    hash: String,
+    shader: String,
+}
+
 /// Dry run of the legacy watch and comparison, with an independent cursor
 /// and record image. Only the production round is allowed to publish views.
 #[cfg(windows)]
@@ -877,6 +959,7 @@ fn verify_heap(
             let (first_byte, past_byte) = (first * step, last * step);
             bytes.resize(past_byte - first_byte, 0);
             if !crate::host::read_into((start + first_byte) as *const u8, &mut bytes) {
+                reference.cursor.rf_x4_retry(&[start + first_byte]);
                 continue;
             }
             changed.clear();
@@ -904,11 +987,16 @@ fn verify_heap(
         // round may be the first one that could have seen this record.
         let mut now = [0; 12];
         if !crate::host::read_into(handle as *const u8, &mut now) || record_words(&now) != expected {
+            reference.pending.insert(slot, expected);
             continue;
         }
+        let readers = heap.verify_readers.lock().unwrap_or_else(|e| e.into_inner());
+        let readers: Vec<_> = readers.iter().map(|r| (&r.pso, &r.hash, &r.shader)).collect();
+        let tables = heap.verify_tables.lock().unwrap_or_else(|e| e.into_inner());
         tracing::warn!(
             heap = format_args!("{start:#x}"), slot, page = format_args!("{:#x}", handle & !(crate::watch::PAGE - 1)),
             ?expected, ?scanned, mirrored_key = ?visible,
+            direct_table_reader = ?tables.get(&slot), possible_indexed_readers = ?readers,
             "rf-x4 diverge"
         );
     }
@@ -2543,6 +2631,12 @@ pub(crate) extern "system" fn create_heap(
         indexed: Default::default(),
         #[cfg(windows)]
         picked_ready: Default::default(),
+        #[cfg(windows)]
+        recorded_sync: Default::default(),
+        #[cfg(windows)]
+        verify_readers: Default::default(),
+        #[cfg(windows)]
+        verify_tables: Default::default(),
         #[cfg(windows)]
         verify_state: Default::default(),
     });
