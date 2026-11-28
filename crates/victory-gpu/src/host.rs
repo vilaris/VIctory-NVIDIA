@@ -8827,9 +8827,11 @@ impl HostList {
         for (index, heap) in &sweeps {
             let heap = heap.get();
             if let Some(host) = heap.host() && host.x9_buffers_due(frame) {
-                let found = crate::draw::heap_buffer_pass(heap, host, frame);
+                let found = crate::draw::heap_buffer_pass_x9(heap, host, frame);
                 host.x9_buffer_frame.store(frame, Ordering::Relaxed);
-                refreshes.push((*index, found));
+                if !found.is_empty() {
+                    refreshes.push((*index, found));
+                }
             }
         }
 
@@ -11504,7 +11506,7 @@ impl Meter {
         submit_split_line(frames, |split, flushes| { // rf-x5
             self.rf_x3.sample(elapsed, frames as u64, preparing, prepare_us, split, flushes); // rf-x3
             rf_x5::sample(elapsed, frames as u64, prepare_us, split); // rf-x5
-            crate::rf_x9::sample(frames, split);
+            crate::rf_x9::sample(frames, split, flushes);
         }); // rf-x5
         fresh_open_line(frames);
         crate::heap_marks::line(frames);

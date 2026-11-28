@@ -85,6 +85,65 @@ impl Slots {
     }
 }
 
+/// Dirty buffer slots are sparse between descriptor rounds. Each summary
+/// bit names one 64-slot word of the existing dirty bitmap.
+struct ChangedSlots {
+    slots: Slots,
+    words: Option<Slots>,
+}
+
+impl ChangedSlots {
+    fn new(count: usize) -> Self {
+        Self {
+            slots: Slots::new(count),
+            words: crate::rf_x9::incremental_bindless().then(|| Slots::new(count.div_ceil(64))),
+        }
+    }
+
+    fn put(&self, slot: u32) {
+        if slot as usize / 64 >= self.slots.0.len() {
+            return;
+        }
+        self.slots.put(slot);
+        if let Some(words) = &self.words {
+            words.put(slot / 64);
+        }
+    }
+
+    fn pending(&self) -> bool {
+        self.words.as_ref().unwrap_or(&self.slots).0.iter()
+            .any(|word| word.load(Ordering::Acquire) != 0)
+    }
+
+    fn take(&self) -> Vec<u32> {
+        let Some(words) = &self.words else { return self.slots.take() };
+        let mut out = Vec::new();
+        use std::sync::atomic::Ordering::AcqRel;
+        // Clear the summary before draining its words. A concurrent writer
+        // either makes this drain or leaves a bit for the next drain.
+        for i in words.take() {
+            Slots::of(i as usize, self.slots.0[i as usize].swap(0, Ordering::AcqRel), &mut out, &|_| true);
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn dirty_buffer_summary_drains_only_changed_words() {
+    let dirty = ChangedSlots { slots: Slots::new(200_000), words: Some(Slots::new(200_000usize.div_ceil(64))) };
+    for slots in [[5, 63, 64, 81_909], [11, 80_000, 81_909, 199_999]] {
+        for slot in slots {
+            dirty.put(slot);
+            dirty.put(slot);
+        }
+        assert!(dirty.pending());
+        assert_eq!(dirty.take(), slots);
+        assert!(!dirty.pending());
+        assert!(dirty.take().is_empty());
+    }
+}
+
 /// The record each slot of a heap was last made from, and a lock for every
 /// few hundredth of the slots: whoever makes a slot holds its lock, and no
 /// other.
@@ -186,7 +245,7 @@ pub(crate) struct HostHeap {
     buffers: Slots,
     /// Of those and of the slots that left the set: the ones written since
     /// [`HostHeap::buffer_changes`] last took them.
-    changed: Slots,
+    changed: ChangedSlots,
     /// Title slots holding a view of a texture the title may fill itself (a
     /// placed texture, a texture object), with the frame from which they
     /// are due: such a texture is uploaded when a draw reads it through a
@@ -2087,7 +2146,7 @@ impl HostHeap {
             dynamic_slots: Arc::new(dynamic::Slots::new(extra)),
             strides,
             buffers: Slots::new(count as usize),
-            changed: Slots::new(count as usize),
+            changed: ChangedSlots::new(count as usize),
             textures: Mutex::new(TextureQueue::with_marks(marks.clone())),
             marks,
             tabled: (0..if sampler { 0 } else { count })
@@ -3394,7 +3453,7 @@ impl HostHeap {
 
     pub(crate) fn x9_buffers_due(&self, frame: u64) -> bool {
         self.x9_buffer_frame.load(Ordering::Relaxed) != frame
-            || self.changed.0.iter().any(|bits| bits.load(Ordering::Acquire) != 0)
+            || self.changed.pending()
     }
 
     /// Records what title slot `index` now holds for shaders that pick
