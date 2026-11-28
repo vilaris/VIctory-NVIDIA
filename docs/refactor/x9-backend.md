@@ -63,6 +63,14 @@ O caminho de empacotamento reúne três fases CPU numa onda. A gravação dos co
 
 **Copy-back e texback.** As faixas de shader em voo ainda impedem refreshes que sobrescreveriam seus bytes. O relay mantém as fences, as comparações e o merge. O readback imediato ou sob demanda segue `demand`. O texback de água e física usa o caminho existente, invalidado nos remaps. Para remover a cópia CPU, a prova teria de incluir esse caminho e os acessos CPU fora de `safecopy`. O fetch de demanda atual pode recorrer à fila dedicada preexistente. A substituição precisa ordenar a leitura na fila host sem depender de uma thread parada no fault.
 
+### Captura de UAV
+
+`VICTORY_RF_X9_UAV_CAPTURE=1` registra alterações observadas nas comparações de copy-back. A declaração de UAV raiz conserva toda a view durante a captura, incluindo as chamadas em que `tight.rs` havia aprendido um limite menor. O relatório cumula peças de 64 KiB por shadow, hash, slot raiz quando encontrado e modos de execução indireta ou store por endereço. Para listas agrupadas sem separação por operação, uma peça é atribuída a todos os produtores compatíveis. Bindings sem atribuição têm `binding: "unknown"`. A captura usa os flags que o compare carded já produz, ou as peças que o compare de memória host já retorna. Um trecho carded sem flag válido fica sem observação.
+
+Cada lote custa O(peças declaradas para ler flags + peças alteradas × candidatos a produtor). A captura não introduz readbacks. Registros de gravação repetidos são deduplicados por lista e os intervalos cumulativos são unidos. O teste `repeated_submissions_accumulate_changed_pieces_without_growing_per_draw` modela quatro mil binds e 48 comparações repetidas. O host atualiza `%LOCALAPPDATA%\victory\x9-uav-capture.json` nas amostras do medidor.
+
+Capture cerca de cinco minutos com parede, cena cheia e direção, incluindo transições que acionem streaming. A captura é de diagnóstico. Uma peça ausente dos resultados pode receber um store que deixa o mesmo valor, ou um store em caminhos que a sessão não acionou. A atribuição por binding tampouco prova um limite superior de escrita. Uma amostra em rodízio detectaria algumas violações após a promoção. Os resultados continuam insuficientes para abandonar a cobertura conservadora dos produtores dinâmicos.
+
 ## Handler de escrita
 
 ```text

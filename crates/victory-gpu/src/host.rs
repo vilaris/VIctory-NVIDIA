@@ -3034,11 +3034,26 @@ impl CardPlan {
             }
         }
     }
+
+    fn capture_compares(&self, differs: &[u32]) {
+        if let Some(capture) = &self.uav_capture {
+            capture.compared(self.ranges.iter().filter(|r| r.compared).flat_map(|r| {
+                (0..r.span.pieces).filter_map(move |p| {
+                    let found = differs.get((r.at + p) as usize).is_some_and(|&d| torn::flagged(d));
+                    found.then(|| {
+                        let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                        (r.shadow.as_ref(), lo, hi)
+                    })
+                })
+            }));
+        }
+    }
 }
 
 /// What a submission does for copies in the card's memory.
 struct CardPlan {
     ranges: Vec<CardRange>,
+    uav_capture: Option<x9_uav::Recorded>,
     /// The compare, run after the submission's lists.
     check: Option<ID3D12CommandList>,
     /// The copies whose card side was brought up to date, alive until the
@@ -3099,6 +3114,7 @@ struct Deferred {
     x9_heap_sweeps: Vec<(usize, crate::descriptor::RetainedHeap)>,
     x9_heaps_resolved: bool,
     x9_heap_inserted: Vec<(usize, usize)>,
+    x9_uav: x9_uav::Recorded,
     uploads: Vec<ID3D12Resource>,
     /// Standalone upload footprints kept through this list's fence (movie planes).
     plane_uploads: Vec<(Chunk, u64)>,
@@ -3183,6 +3199,7 @@ impl Deferred {
         self.x9_heap_sweeps.clear();
         self.x9_heaps_resolved = false;
         self.x9_heap_inserted.clear();
+        self.x9_uav.clear();
         self.uploads.clear();
         self.prelude_uploads.clear();
         self.upload_bytes = 0;
@@ -4572,12 +4589,17 @@ impl RelayBack {
     }
 
     /// What differs goes into title memory.
-    fn merge(mut self) {
+    fn merge(mut self, capture: Option<&x9_uav::Recorded>) {
         use crate::land;
         self.look(land::stat::SCAN);
         let Some(found) = self.found else {
             return;
         };
+        if let Some(capture) = capture {
+            capture.compared(self.work.iter().zip(&found).flat_map(|((shadow, ..), changed)| {
+                changed.iter().map(move |&(lo, n)| (shadow.as_ref(), lo, lo + n))
+            }));
+        }
         let merging = std::time::Instant::now();
         let mut written: Vec<u64> = Vec::new();
         if land::on() {
@@ -4780,6 +4802,7 @@ mod water_timing;
 mod gpu_time;
 pub(crate) mod render_trace;
 mod x9_plan;
+mod x9_uav;
 pub(crate) use gpu_time::{Step as GpuStep, count_barriers as count_gpu_barriers, count_step as count_gpu_step};
 #[cfg(feature = "diagnostics")]
 pub(crate) use stamps::{timeline_ready, timeline_restart, timeline_stamps};
@@ -4969,8 +4992,8 @@ fn read_backs(list: &HostList) {
 
 /// After the card ran what declared `back`: what shaders wrote there goes
 /// into title memory, and the ranges are done with.
-fn hand_back(back: &[Declared]) {
-    if crate::shadow::wide_back() {
+fn hand_back(back: &[Declared], capture: Option<&x9_uav::Recorded>) {
+    if capture.is_some() || crate::shadow::wide_back() {
         // Every range first (the pieces that differ, found on several
         // threads), then the merges, in order, as below.
         let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
@@ -4992,6 +5015,11 @@ fn hand_back(back: &[Declared]) {
         #[cfg(feature = "diagnostics")]
         let scanning = std::time::Instant::now();
         let found = crate::shadow::find_all(&work);
+        if let Some(capture) = capture {
+            capture.compared(work.iter().zip(&found).flat_map(|((shadow, ..), changed)| {
+                changed.iter().map(move |&(lo, n)| (shadow.as_ref(), lo, lo + n))
+            }));
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
         for ((shadow, from, to), found) in work.iter().zip(found) {
@@ -5555,6 +5583,7 @@ impl Host {
         let mark = card_time(2, mark);
         let mut plan = CardPlan {
             ranges: Vec::new(),
+            uav_capture: None,
             check: None,
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
             lists: used,
@@ -5943,6 +5972,7 @@ impl Host {
             let mut seen = std::collections::HashSet::new();
             for &(plan, behind) in plans {
                 plan.picked_found(differs);
+                plan.capture_compares(differs);
                 let flags: Vec<(usize, u32, bool)> = plan
                     .ranges
                     .iter()
@@ -6296,7 +6326,8 @@ impl Host {
                     }
                 });
                 stage.next("landing: copies in the PC's memory");
-                hand_back.merge();
+                let capture = x9_uav::Recorded::collect(flights.iter().flat_map(|f| f.order.iter().map(|&i| f.lists[i].host())));
+                hand_back.merge(capture.as_ref());
                 stage.next("landing: ranges done with");
                 let finishing = std::time::Instant::now();
                 // Only now, and flight by flight: a range another flight
@@ -6432,6 +6463,7 @@ impl Host {
         let mut pieces: Vec<(usize, usize, usize, u64)> = Vec::new();
         let mut total = 0u64;
         plan.picked_found(differs);
+        plan.capture_compares(differs);
         for (i, r) in plan.ranges.iter().enumerate().filter(|(_, r)| !r.picked) {
             for p in 0..r.span.pieces {
                 if r.compared && !torn::flagged(differs[(r.at + p) as usize]) {
@@ -6891,7 +6923,11 @@ impl Host {
                         }
                     }
                 }
-                hand_back(&back);
+                let capture = x9_uav::Recorded::collect(items.iter().filter_map(|item| match item {
+                    Late::Run(flight) => Some(flight),
+                    _ => None,
+                }).flat_map(|f| f.order.iter().map(|&i| f.lists[i].host())));
+                hand_back(&back, capture.as_ref());
                 COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
             // In the order given: what tells the title the card is done.
@@ -7259,7 +7295,10 @@ impl Host {
             shadow.writing(*at, *len);
         }
         let declared = declared_writes(runs);
-        let card = self.card_before(&declared, &picked, flown);
+        let mut card = self.card_before(&declared, &picked, flown);
+        if let Some(card) = card.as_mut() {
+            card.uav_capture = x9_uav::Recorded::collect(runs.iter().copied());
+        }
         if let Some(probe) = probe {
             let finished = FINISHED.load(Ordering::Acquire);
             two_queues::place(probe, this_submission, card.is_some(), own.is_some(), runs.len(), finished);
@@ -7462,7 +7501,8 @@ impl Host {
             self.card_back(card, &mut submitted, &mut std::collections::HashSet::new());
         }
         let back = crate::picked::with(declared, &picked.written);
-        hand_back(&back);
+        let capture = x9_uav::Recorded::collect(runs.iter().copied());
+        hand_back(&back, capture.as_ref());
         if let Some(card) = card {
             self.card_done(card);
         }
@@ -7816,6 +7856,21 @@ impl HostList {
     /// targets change ([`Self::gpu_pass_break`]), each compute pipeline's
     /// run of dispatches is one. `name` is asked only for a new pass.
     pub(crate) fn gpu_pass(&self, compute: bool, pipeline: usize, shaders: Option<&crate::pipeline::host::HostPipeline>, command: render_trace::Command, name: impl FnOnce() -> String) {
+        if x9_uav::enabled() && let Some(shaders) = shaders {
+            let mut deferred = self.deferred();
+            for stage in &shaders.stages {
+                let translated = stage.translated();
+                if (translated.stores || translated.stores_by_address)
+                    && let Ok(hash) = u64::from_str_radix(&stage.shader.hash, 16)
+                {
+                    deferred.x9_uav.shader(x9_uav::Shader {
+                        hash,
+                        by_address: translated.stores_by_address,
+                        indirect: command.0 == "execute_indirect",
+                    });
+                }
+            }
+        }
         if let Some(mut title) = self.rf_x7_title() {
             title.shader_work(crate::rf_x7::possible_uav_access(shaders));
         }
@@ -7824,6 +7879,20 @@ impl HostList {
         self.gpu_time.work();
         let (key, kind) = if compute { (pipeline as u64 | 1, gpu_time::COMPUTE) } else { (2, gpu_time::DRAW) };
         self.gpu_time.pass(&self.list, key, kind, command, name);
+    }
+
+    pub(crate) fn capture_x9_root_uav(&self, shader: &str, slot: u8, shadow: &crate::shadow::Shadow, address: u64, len: u64) -> bool {
+        if !x9_uav::enabled() {
+            return false;
+        }
+        if let Ok(hash) = u64::from_str_radix(shader, 16) {
+            let from = address.saturating_sub(shadow.span().0);
+            let to = from.saturating_add(len).min(shadow.span().1);
+            self.deferred().x9_uav.root(hash, slot, shadow.id(), from as usize, to as usize);
+        }
+        // Capture compares the full binding, even when the previous
+        // session's heuristic would have narrowed the declaration.
+        true
     }
 
     /// The render targets changed: the next draw begins a GPU pass.
@@ -11509,6 +11578,7 @@ impl Meter {
             rf_x5::sample(elapsed, frames as u64, prepare_us, split); // rf-x5
             crate::rf_x9::sample(frames, split, flushes);
         }); // rf-x5
+        x9_uav::save();
         fresh_open_line(frames);
         crate::heap_marks::line(frames);
         crate::pipeline::rf_x6::line(frames); // rf-x6
