@@ -10,6 +10,12 @@ pub(crate) fn enabled() -> bool {
 }
 
 #[cfg(windows)]
+pub(crate) fn incremental_bindless() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| enabled() && std::env::var_os("VICTORY_RF_X9_BINDLESS_INCREMENTAL").is_some_and(|v| v == "1"))
+}
+
+#[cfg(windows)]
 pub(crate) fn verify() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| enabled() && std::env::var_os("VICTORY_RF_X9_VERIFY").is_some_and(|v| v == "1"))
@@ -90,6 +96,26 @@ impl Ranges {
 
     pub(crate) fn spans(&self) -> &[(usize, usize)] {
         &self.0
+    }
+
+    /// Visit the parts of an interval that still need to be refreshed.
+    pub(crate) fn uncovered(&self, from: usize, to: usize, mut visit: impl FnMut(usize, usize)) {
+        if from >= to {
+            return;
+        }
+        let mut next = from;
+        for &(lo, hi) in &self.0[self.0.partition_point(|r| r.1 <= from)..] {
+            if lo >= to {
+                break;
+            }
+            if next < lo {
+                visit(next, lo);
+            }
+            next = next.max(hi);
+        }
+        if next < to {
+            visit(next, to);
+        }
     }
 }
 
@@ -247,6 +273,15 @@ mod telemetry {
     static CPU_READ: AtomicU64 = AtomicU64::new(0);
     static GPU_WRITER: AtomicU64 = AtomicU64::new(0);
     static STALE: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    static BINDLESS_BUFFERS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+    pub(crate) fn bindless_buffers(fresh_frame: bool, slots: usize, refreshes: usize) {
+        if stats() {
+            BINDLESS_BUFFERS[usize::from(!fresh_frame)].fetch_add(1, Ordering::Relaxed);
+            BINDLESS_BUFFERS[2].fetch_add(slots as u64, Ordering::Relaxed);
+            BINDLESS_BUFFERS[3].fetch_add(refreshes as u64, Ordering::Relaxed);
+        }
+    }
 
     pub(crate) fn stale_reason(reason: usize) {
         if stats() {
@@ -304,7 +339,7 @@ mod telemetry {
         }
     }
 
-    pub(crate) fn sample(frames: f64, split: [u64; 16]) {
+    pub(crate) fn sample(frames: f64, split: [u64; 16], flushes: [u64; 4]) {
         if !stats() || frames <= 0.0 {
             return;
         }
@@ -331,6 +366,12 @@ mod telemetry {
         tracing::info!(
             "rf-x9: flights[count/ms per frame merge={:.1}/{:.3} settle-and-recheck={:.1}/{:.3}] merge-fallbacks/frame[untracked-or-dirty={untracked:.1} unknown-writes={unknown:.1} changed-runs={budget:.1} no-snapshot={snapshot:.1}]",
             under[0], under[1], settle[0], settle[1],
+        );
+        let [frame_start, later, slots, scheduled] = BINDLESS_BUFFERS.each_ref().map(per_frame);
+        let [waves, checks, clean, parallel] = flushes.map(|n| n as f64 / frames);
+        tracing::info!(
+            "rf-x9: refreshes/frame[flushes={waves:.1} checks={checks:.1} clean={clean:.1} parallel={parallel:.1}] bindless-buffers/frame[first={frame_start:.1} later={later:.1} slots={slots:.1} refreshes={scheduled:.1}] incremental={}",
+            super::incremental_bindless(),
         );
     }
 }

@@ -722,11 +722,23 @@ pub(crate) struct BufferSweep {
     ranges: HeapRanges<std::sync::Arc<crate::shadow::Shadow>>,
     // Last refresh frame and covered interval for throttled, unwatched copies.
     unwatched: std::collections::HashMap<u64, (u64, u64, u64)>,
+    coverage: HeapRefreshCoverage,
 }
 
 impl Default for BufferSweep {
     fn default() -> Self {
-        Self { passes: 0, ranges: HeapRanges(Vec::new()), unwatched: Default::default() }
+        Self { passes: 0, ranges: HeapRanges(Vec::new()), unwatched: Default::default(), coverage: Default::default() }
+    }
+}
+
+#[derive(Default)]
+struct HeapRefreshCoverage(crate::host::ByCopy<crate::rf_x9::Ranges>);
+
+impl HeapRefreshCoverage {
+    fn add(&mut self, pending: &mut crate::host::ByCopy<crate::rf_x9::Ranges>, copy: usize, from: usize, to: usize) {
+        let covered = self.0.entry(copy).or_default();
+        covered.uncovered(from, to, |lo, hi| pending.entry(copy).or_default().insert(lo, hi));
+        covered.insert(from, to);
     }
 }
 
@@ -755,7 +767,45 @@ impl<T> HeapRanges<T> {
 
 #[cfg(test)]
 mod heap_range_tests {
-    use super::{HEAP_ROUND, HeapRanges};
+    use super::{HEAP_ROUND, HeapRanges, HeapRefreshCoverage};
+
+    #[test]
+    fn bindless_changes_do_not_reschedule_the_heap_for_each_submission() {
+        const HEAPS: usize = 4;
+        const SUBMISSIONS: usize = 48;
+        const SLOTS: usize = 81_000;
+        const COPIES: usize = 2_500;
+        const PAGE: usize = 4096;
+        let mut heaps: [HeapRefreshCoverage; HEAPS] = Default::default();
+        let mut looked = 0;
+        let mut refreshes = 0;
+        let mut bytes = 0;
+        let mut waves = 0;
+        for (heap, coverage) in heaps.iter_mut().enumerate() {
+            for submission in 0..SUBMISSIONS {
+                let touched = if submission == 0 { SLOTS } else { 3 };
+                looked += touched;
+                let mut pending: crate::host::ByCopy<crate::rf_x9::Ranges> = Default::default();
+                for slot in 0..touched {
+                    let copy = if submission == 0 { slot % COPIES } else { slot / 2 };
+                    let start = if submission != 0 && slot == 2 { submission * PAGE } else { 0 };
+                    coverage.add(&mut pending, copy, start, start + PAGE);
+                }
+                let mut nonempty = false;
+                for ranges in pending.values() {
+                    refreshes += ranges.spans().len();
+                    bytes += ranges.spans().iter().map(|&(lo, hi)| hi - lo).sum::<usize>();
+                    nonempty |= !ranges.spans().is_empty();
+                }
+                waves += usize::from(nonempty);
+                assert_eq!(refreshes, heap * (COPIES + SUBMISSIONS - 1) + COPIES + submission);
+            }
+        }
+        assert_eq!(looked, HEAPS * (SLOTS + (SUBMISSIONS - 1) * 3));
+        assert_eq!(refreshes, HEAPS * (COPIES + SUBMISSIONS - 1));
+        assert_eq!(bytes, refreshes * PAGE);
+        assert_eq!(waves, HEAPS * SUBMISSIONS);
+    }
 
     /// Round by round every slot is looked at again once, whatever was
     /// written between, and what a slot holds is what was found last.
@@ -1200,6 +1250,14 @@ const OTHERS: usize = 1;
 /// ([`State::heap_buffers`]): their host slots are made, and the host copies
 /// they show are to be refreshed.
 pub(crate) fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::HostHeap, frame: u64) -> Vec<crate::host::aside::Refresh> { // rf-x9
+    heap_buffer_pass_impl(heap, host, frame, false)
+}
+
+pub(crate) fn heap_buffer_pass_x9(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::HostHeap, frame: u64) -> Vec<crate::host::aside::Refresh> {
+    heap_buffer_pass_impl(heap, host, frame, true)
+}
+
+fn heap_buffer_pass_impl(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::HostHeap, frame: u64, at_submit: bool) -> Vec<crate::host::aside::Refresh> {
     let started = std::time::Instant::now();
     // Per host heap: the host copy and range each slot's buffer view
     // reads, kept from pass to pass. Only the slots written since the
@@ -1208,10 +1266,15 @@ pub(crate) fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::des
     // released resource goes stale without a write, and a slot written
     // before its memory had a host copy is only made then.
     let mut kept = host.buffer_sweep.lock().unwrap_or_else(|e| e.into_inner());
-    let BufferSweep { passes, ranges, unwatched } = &mut *kept;
+    let BufferSweep { passes, ranges, unwatched, coverage } = &mut *kept;
+    let incremental = at_submit && crate::rf_x9::incremental_bindless();
+    let first_this_frame = host.x9_buffer_frame.load(Ordering::Relaxed) != frame;
+    let delta = incremental && !first_this_frame;
     let changed = host.buffer_changes();
-    let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
-    let slots = if all {
+    let all = !delta && (*passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread()));
+    let slots = if delta {
+        changed
+    } else if all {
         ranges.0.clear();
         host.buffer_slots()
     } else if heap_spread() {
@@ -1224,7 +1287,9 @@ pub(crate) fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::des
     } else {
         changed
     };
-    *passes += 1;
+    if !delta {
+        *passes += 1;
+    }
     // Whether the device was there before the pass: a view that removes
     // it is named below.
     static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1280,6 +1345,8 @@ pub(crate) fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::des
         }
         let _ = found[n].set(looked);
     });
+    let mut pending = crate::host::ByCopy::default();
+    let mut copies = crate::host::ByCopy::default();
     for (index, shows) in found.into_iter().filter_map(std::sync::OnceLock::into_inner).flatten() {
         let range = shows.map(|(range, written)| {
             if written {
@@ -1287,10 +1354,27 @@ pub(crate) fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::des
             }
             range
         });
+        if delta && let Some((shadow, from, to)) = &range && !shadow.in_place() {
+            let copy = shadow.id() as usize;
+            let end = (*to).min(*from + shadow.left(*from));
+            coverage.add(&mut pending, copy, *from as usize, end as usize);
+            copies.entry(copy).or_insert_with(|| shadow.clone());
+        }
         ranges.set(index, range);
     }
     if crate::picked::on() {
         crate::picked::shown(unordered, all);
+    }
+    if delta {
+        let refreshes: Vec<_> = pending.iter().flat_map(|(copy, ranges)| {
+            let shadow = &copies[copy];
+            ranges.spans().iter().map(move |&(lo, hi)| (shadow.clone(), lo as u64, hi as u64))
+        }).collect();
+        crate::rf_x9::bindless_buffers(false, slots.len(), refreshes.len());
+        return refreshes;
+    }
+    if incremental {
+        coverage.0.clear();
     }
     #[cfg(feature = "diagnostics")]
     let looked = std::time::Instant::now();
@@ -1329,7 +1413,11 @@ pub(crate) fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::des
             }
             next_unwatched.insert(id, (frame, *from, *to));
         }
-        found.push((shadow.clone(), *from, (*to).min(*from + shadow.left(*from))));
+        let end = (*to).min(*from + shadow.left(*from));
+        if incremental && !shadow.in_place() {
+            coverage.0.entry(shadow.id() as usize).or_default().insert(*from as usize, end as usize);
+        }
+        found.push((shadow.clone(), *from, end));
     }
     *unwatched = next_unwatched;
     drop(kept);
@@ -1353,6 +1441,9 @@ pub(crate) fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::des
             ms = started.elapsed().as_millis(),
             "buffer views of the heap made ready for shaders that pick them by index"
         );
+    }
+    if at_submit {
+        crate::rf_x9::bindless_buffers(first_this_frame, slots.len(), found.iter().filter(|(shadow, _, _)| !shadow.in_place()).count());
     }
     found
 }
