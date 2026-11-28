@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(windows)]
 pub(crate) fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // On by default (measured: faster while streaming, even when standing); "0" turns it off.
-    *ON.get_or_init(|| std::env::var_os("VICTORY_RF_X9").is_none_or(|v| v != "0"))
+    // Off by default: on the RTX 4070 it lowers CPU preparation but adds GPU waits (net 16-18 fps vs 18-20 off). "1" turns it on.
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RF_X9").is_some_and(|v| v == "1"))
 }
 
 #[cfg(windows)]

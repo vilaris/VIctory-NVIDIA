@@ -103,7 +103,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\play-nvidia.ps1 -Exe
 | `-FgType` | `auto` by default. Also accepts `dlss` and `fsr`. |
 | `-Fps` | 1 to 1000. The default of 1000 is effectively uncapped. The title's original cap is 30. |
 | `-Preload` | Off by default. Prepares shaders and pipelines before launch. |
-| `-More` | PowerShell hashtable of overrides, empty by default. For example, `-More @{VICTORY_RF_X9='0'}`. |
+| `-More` | PowerShell hashtable of overrides, empty by default. For example, `-More @{VICTORY_RF_X9='1'}`. |
 
 **Shader cache.** A nonempty [translator.pin](crates/victory-gpu/translator.pin) supplies the translator fingerprint and allows cached translations to survive rebuilds. If you change the translator, remove the pin before building so the build script fingerprints the source again and invalidates stale translations.
 
@@ -120,7 +120,7 @@ The launchers clear inherited `VICTORY_*` performance switches before applying t
 
 | Performance switch | Default | Effect |
 | --- | --- | --- |
-| `VICTORY_RF_X9` | On | Enables the experimental coherence and submission backend. Set `VICTORY_RF_X9=0` to use the previous path. |
+| `VICTORY_RF_X9` | Off | Experimental coherence and submission backend. It lowers CPU preparation but currently adds GPU waits, so it is a net loss on the RTX 4070 (16–18 FPS on vs 18–20 off). Set `VICTORY_RF_X9=1` to test it. |
 | `VICTORY_RF_X7_NARROW` | On | Narrows eligible barriers emitted by the compatibility layer. Set `VICTORY_RF_X7_NARROW=0` to disable it. |
 | `VICTORY_RF_X7_TITLE_UAV` | Off | Experiments with omitting redundant global UAV waits in the title's command stream. |
 | `VICTORY_RF_X7_VERIFY`, `VICTORY_RF_X7_VALIDATE`, `VICTORY_RF_X9_VERIFY` and `VICTORY_RF_*_STATS` | Off | Enable the corresponding checks or telemetry explicitly. X9 verification also requires X9 to be enabled. |
@@ -145,17 +145,17 @@ The Series S investigations used an RTX 4070, a Ryzen 7 5700X, and 32 GB of RAM.
 
 Mesh output counts, resolution, PCIe reads, and texture inflation were investigated and ruled out as primary explanations for the measured limit. See the [synchronization trace](docs/refactor/x2-sincronizacao.md), [barrier analysis](docs/refactor/x7-barreiras.md), [fault measurements](docs/refactor/x5-submissao.md), and [graphics audit](docs/auditoria-grafica/).
 
-### Earlier X9 measurements
+### Current numbers
 
-These are rendered frame rates from the previous X9 delivery on the Series S setup above.
+Rendered frame rates on the Series S setup above, with the defaults (X7 narrowing on, X9 off), measured after the warm-up restart.
 
 | Scene | Rendered FPS |
 | --- | ---: |
-| Standing still in a heavy scene | ~18–18.5 |
+| Standing still in a heavy scene | ~18–20 |
 | Facing a wall | ~19–20 |
 | Driving | ~12–14 |
 
-**X9 is still in development.** Changes starting at `107c991` regressed to about 66,000 refreshes per frame and about 8 FPS in testing. The fix is in progress. Set `VICTORY_RF_X9=0` to compare with the prior submission path.
+**X9 is still in development and off by default.** With `VICTORY_RF_X9=1` the same heavy scene measured 16–18 FPS: CPU preparation drops, but new GPU waits outweigh it. Changes starting at `107c991` once regressed to about 66,000 refreshes per frame; that is fixed (`VICTORY_RF_X9_BINDLESS_INCREMENTAL`, and the bindless descriptor wait moved out of the default path).
 
 X9 already uses bitmap tracking for eligible guard faults, parallel preparation for refreshes and uploads, and a fence-retired upload ring. The next work is to make memory ownership explicit for eligible GPU-only, CPU-streamed, and static ranges, and to overlap preparation of successive submissions while preserving coherence. Removing redundant waits in the title's command stream is a separate GPU task. [X9 implementation and roadmap](docs/refactor/x9-backend.md)
 
