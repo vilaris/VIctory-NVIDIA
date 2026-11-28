@@ -202,9 +202,10 @@ mod runtime {
             let bytes = c.part(FourCC::SFI0)?.data.get(..8)?.try_into().ok()?;
             Some(u64::from_le_bytes(bytes))
         });
-        let mut mask = features.map_or(BOTH, |bits| {
-            u8::from(bits & 0x200_0000 != 0) * VIEWS | u8::from(bits & 0x400_0000 != 0) * SAMPLERS
-        });
+        let Some(bits) = features else {
+            return BOTH;
+        };
+        let mut mask = (u8::from(bits & 0x200_0000 != 0) * VIEWS) | (u8::from(bits & 0x400_0000 != 0) * SAMPLERS);
         if t.host.root_srvs.contains(&SLOT_STRIDES) {
             mask |= VIEWS;
         }

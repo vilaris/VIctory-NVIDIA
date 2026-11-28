@@ -1983,7 +1983,8 @@ impl State {
             for stage in &p.stages {
                 let t = stage.translated();
                 let missing_table = t.host.user_data.iter().filter(|u| u.root == RootType::Table).any(|u| {
-                    !matches!(self.roots_ref(compute).get(usize::from(u.slot)), Some(Root::Table(h)) if self.heap_of(*h).is_some())
+                    let Some(&Root::Table(h)) = self.roots_ref(compute).get(usize::from(u.slot)) else { return true };
+                    !self.heap_of(h).is_some_and(|heap| heap.index(h).and_then(|slot| heap.handle(slot)) == Some(h))
                 });
                 crate::descriptor::rf_x4::note_shader(list, self.heaps, &stage.shader, t, missing_table);
             }
