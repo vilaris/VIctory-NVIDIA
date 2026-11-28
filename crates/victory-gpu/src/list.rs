@@ -1921,7 +1921,7 @@ extern "system" fn ignored_state(_: This) {}
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
 mod state {
-    use super::{This, with_binding, with_state};
+    use super::{This, host_list_ordered, with_binding, with_state, with_state_on};
     use crate::draw::{IndexView, VertexView};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
