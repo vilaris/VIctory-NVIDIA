@@ -215,6 +215,12 @@ impl Heap {
         if !self.indexed.load(Acquire) {
             self.indexed.store(true, Release);
         }
+        if crate::rf_x9::enabled() && self.samplers() {
+            // The list retains the sampler heap. Sampler discovery has no
+            // buffer-shadow or texture-upload pass to feed while recording.
+            // The list's heap-pick bit requires a round before execution.
+            return;
+        }
         if rf_x4::picked() && rf_x4::late_lane() && sync_on() {
             self.picked_ready.get_or_init(|| {
                 // A round may have begun before the interval was published.
@@ -335,7 +341,7 @@ fn sync_on() -> bool {
 /// before the lists go to the queue, and nothing of the preparing looks at
 /// them (what a draw reads through a table it made itself, when recorded).
 #[cfg(windows)]
-fn sync_aside() -> bool {
+pub(crate) fn sync_aside() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| sync_on() && std::env::var_os("VICTORY_HEAP_SYNC_ASIDE").is_none_or(|v| v != "0"))
 }
@@ -421,10 +427,20 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
         return SyncedHeaps(None);
     }
     let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
-    rounds.0 += 1;
-    let mine = rounds.0;
+    let (mine, ask) = if crate::rf_x9::enabled() {
+        // A pending round that has not started yet already meets this
+        // caller's publication boundary. An active round never does.
+        crate::heap_marks::round_after(rounds.0, rounds.1)
+    } else {
+        (rounds.0 + 1, true)
+    };
+    if ask {
+        rounds.0 = mine;
+    }
     drop(rounds);
-    SYNC_ROUNDS.1.notify_all();
+    if ask {
+        SYNC_ROUNDS.1.notify_all();
+    }
     SyncedHeaps(Some(mine))
 }
 

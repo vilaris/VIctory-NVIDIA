@@ -6940,7 +6940,9 @@ impl Host {
         let needs_heaps = (late || x9) && runs.iter().any(|l| l.heap_picked());
         // Else with [`heap_sync_first`]: the heaps' records begun now, beside
         // the planning of steps done on the card and the look at flights.
-        let first_heaps = (late && needs_heaps && heaps_mark == 0 && heap_sync_first()).then(crate::descriptor::begin_sync_heaps);
+        let first_heaps = (late && needs_heaps && heaps_mark == 0
+            && (heap_sync_first() || (x9 && crate::descriptor::sync_aside())))
+            .then(crate::descriptor::begin_sync_heaps);
         let ahead = Split::begin();
         SPLIT[11].fetch_add(called.elapsed().as_nanos() as u64, Ordering::Relaxed);
         stage.next("submit: steps given to the card");
@@ -7069,6 +7071,7 @@ impl Host {
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
         let mut settled = std::time::Duration::ZERO;
+        let mut x9_heaps_after_settle = false;
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         let once = crate::watch::once();
@@ -7100,11 +7103,13 @@ impl Host {
                 let settling = std::time::Instant::now();
                 self.settle_stale(&mut submitted, runs, stale, &batch.ranges);
                 settled += settling.elapsed();
+                x9_heaps_after_settle = x9 && needs_heaps;
             }
         } else if behind && !stale_under_flights(runs).is_empty() {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
+            x9_heaps_after_settle = x9 && needs_heaps;
         }
         split.part(1);
         // What flights in the air may write.
@@ -7138,6 +7143,7 @@ impl Host {
                 std::mem::forget(old);
             }
             heaps_synced = Some(crate::descriptor::begin_sync_heaps());
+            x9_heaps_after_settle = false;
         }
         split.part(2);
         stage.next("submit: snapshots");
@@ -7161,6 +7167,7 @@ impl Host {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
+            x9_heaps_after_settle = x9 && needs_heaps;
         }
         // What shaders may write through views they pick: last, so that no
         // refresh of this submission leaves it alone.
@@ -7186,6 +7193,14 @@ impl Host {
         split.part(4);
         stage.next("submit: waiting for the heaps' records");
         let heaps_began = std::time::Instant::now();
+        if x9_heaps_after_settle {
+            // A flight can land a heap's title bytes while the original
+            // round is in progress. Join a round started after the landing.
+            if let Some(old) = heaps_synced.take() {
+                std::mem::forget(old);
+            }
+            heaps_synced = Some(crate::descriptor::begin_sync_heaps());
+        }
         drop(heaps_synced);
         if crate::heap_marks::on() {
             crate::heap_marks::heaps_waited(heaps_began.elapsed().as_nanos() as u64);
