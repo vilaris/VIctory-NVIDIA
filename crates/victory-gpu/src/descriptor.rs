@@ -400,6 +400,14 @@ pub(crate) fn in_shader_heap(at: usize, len: usize) -> bool {
 }
 
 #[cfg(windows)]
+pub(crate) fn shader_heap_extent(at: usize, len: usize) -> Option<(u64, u64)> {
+    let (from, to) = (at as u64, (at as u64).saturating_add(len as u64));
+    SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner()).iter()
+        .find(|&&(start, end, _)| start <= from && to <= end)
+        .map(|&(start, end, _)| (start, end - start))
+}
+
+#[cfg(windows)]
 impl Drop for SyncedHeaps {
     fn drop(&mut self) {
         let Some(mine) = self.0 else {
@@ -454,6 +462,7 @@ pub(crate) fn sync_heaps() {
         else {
             continue;
         };
+        let rf_x3 = crate::rf_x3::timer().map(|start| (start, bytes));
         let step = u64::from(step);
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
@@ -641,6 +650,10 @@ pub(crate) fn sync_heaps() {
         spent[2] += since(began);
         if !wait.is_empty() {
             host.copied_wait(frame, std::mem::take(&mut wait));
+        }
+        if let Some((started, before_bytes)) = rf_x3 {
+            use crate::rf_x3::{Kind, Object, Source, elapsed, work};
+            work(Object::new(start, end - start, Kind::DescriptorHeap), Source::DescriptorSync, bytes - before_bytes, elapsed(started));
         }
     }
     drop(heaps);

@@ -316,6 +316,22 @@ pub(crate) fn block_write_sig(from: usize, to: usize) -> Option<(u64, u64)> {
     Some((sum, ASK_END_GEN.load(std::sync::atomic::Ordering::Acquire)))
 }
 
+/// A single, real, protected block with the same published answer used
+/// by the legacy shadow memo. This does not consult the journal or kernel.
+pub(crate) fn rf_x3_guard_sig(from: usize, to: usize) -> Option<u64> {
+    use std::sync::atomic::Ordering::Acquire;
+    let block = crate::rf_x3::single_block(from, to, BLOCK)?;
+    let generation = || {
+        ALL_WRITE_GEN.load(Acquire).wrapping_add(BLOCK_WRITE_GEN[block % WRITE_BLOCKS].load(Acquire))
+    };
+    let before = generation();
+    let past = block + 1;
+    if !PROTECTED.all(block, past) || ALIASED.any(block, past) || OPENING.any(block, past) || !published(from, to) {
+        return None;
+    }
+    (before == generation()).then_some(before)
+}
+
 fn journal() -> std::sync::RwLockReadGuard<'static, Journal> {
     if let Ok(j) = JOURNAL.try_read() {
         return j;
@@ -865,6 +881,8 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    use crate::rf_x3::{Check, checked, timer};
+    let started = timer();
     // Guarding asks Windows about the pages and protects them: a lazy view
     // is none to it yet. (Not so a view in the books alone, which is
     // guarded there: [`use_soft_views`].)
@@ -876,6 +894,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     // Asked ahead with the submission's other ranges: the journal has it.
     let ahead = |j: &Journal| covered(j, first, last).then(|| (j.ahead_asked, of(j)));
     if let Some(known) = ahead(&journal()) {
+        checked(started, Check::WatchAhead);
         return Some(known);
     }
     // Read-only since an asking noted it: the bits first, then the journal.
@@ -886,12 +905,15 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             crate::faultbook::note(crate::faultbook::What::Known, first, last, 0);
         }
         let j = journal();
-        return Some((next_asking(), of(&j)));
+        let answer = (next_asking(), of(&j));
+        checked(started, Check::WatchPublished);
+        return Some(answer);
     }
     // Asked, and the answer noted, with the range held: nothing else asks
     // about any of it in between.
     let _range = Asking::hold(first, last);
     if let Some(known) = ahead(&journal()) {
+        checked(started, Check::WatchAhead);
         return Some(known);
     }
     let mut guards_asked = false;
@@ -902,6 +924,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         None => {
             guards_asked = true;
             if !guarded {
+                checked(started, Check::WatchUntracked);
                 return None;
             }
             #[cfg(feature = "diagnostics")]
@@ -918,13 +941,20 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
                     slow(us);
                 }
             }
-            written?
+            let Some(written) = written else {
+                checked(started, Check::WatchUntracked);
+                return None;
+            };
+            written
         }
     };
+    let reason = if guards_asked { Check::WatchGuards } else { Check::WatchKernel };
     if pages.is_empty() {
         // Nothing to note: the others may go on reading.
         let j = journal();
-        return Some((next_asking(), of(&j)));
+        let answer = (next_asking(), of(&j));
+        checked(started, reason);
+        return Some(answer);
     }
     let answer = {
         let mut j = journal_mut();
@@ -940,6 +970,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     if guards_asked && light() {
         publish(&pages.iter().map(|p| p.0).collect::<Vec<_>>());
     }
+    checked(started, reason);
     Some(answer)
 }
 
@@ -1029,6 +1060,8 @@ pub(crate) fn writes_apart(start: usize, end: usize) -> Option<Vec<(usize, u64)>
 /// asked: the submission's asking covers the range, or its blocks are known
 /// by their bits. `false` if something would have to be asked.
 pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64], parts: &PartsTaken, ranged: u64) -> bool {
+    use crate::rf_x3::{Check, checked, journal_result, timer};
+    let started = timer();
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     // The bits first, then the journal, as in `writes`.
     let known = published(start, end);
@@ -1038,9 +1071,11 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
     }
     let j = journal();
     if !known && !covered(&j, first, last) {
+        checked(started, Check::JournalUnknown);
         return false;
     }
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
+        journal_result(started, known, false);
         return false;
     };
     // The parts of `page` that hold bytes of the range.
@@ -1053,14 +1088,16 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
         for (n, _) in taken.iter().enumerate().filter(|(_, at)| **at == 0) {
             let page = first + n;
             let Some(stamps) = parts.get(&(page - base)) else {
+                journal_result(started, known, false);
                 return false;
             };
             if within(page).any(|k| stamps[k] == 0) {
+                journal_result(started, known, false);
                 return false;
             }
         }
     }
-    j.written.range(first..last).all(|(&page, &write)| {
+    let clean = j.written.range(first..last).all(|(&page, &write)| {
         let at = taken[page - first].max(ranged);
         if at != 0 && write <= at {
             return true;
@@ -1074,7 +1111,9 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
             let at = at.max(stamps[k]);
             at != 0 && each.map_or(write, |w| w[k]) <= at
         })
-    })
+    });
+    journal_result(started, known, clean);
+    clean
 }
 
 /// Per page of `pages`: the asking that last found each of its 4 KiB parts

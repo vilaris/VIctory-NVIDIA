@@ -526,6 +526,17 @@ pub(crate) fn cover(at: usize, len: usize) -> Cover {
     cover_in(&views().views, at, len)
 }
 
+/// For rf-x3, sample the mapping and section creation mode together.
+pub(crate) fn section_cover(at: usize, len: usize) -> (Cover, Option<bool>) {
+    let v = views();
+    let cover = cover_in(&v.views, at, len);
+    let committed = match cover {
+        Cover::Run(section, _) => v.sections.get(&section).map(|&(_, committed)| committed),
+        _ => None,
+    };
+    (cover, committed)
+}
+
 /// The whole stretch of views around `[at, at + len)` that follow one
 /// another in memory and in one section alike, if the range is one run of a
 /// section ([`Cover::Run`]): its first address, its bytes, the section and
@@ -634,15 +645,22 @@ pub(crate) fn beside_page(page: usize) -> Option<(usize, [usize; 8])> {
 /// one's state: a millisecond in the title's big blocks, so ask when a
 /// copy is made, not when it is used).
 pub(crate) fn private_whole(at: usize, len: usize) -> bool {
+    private_readwrite_region(at).is_some_and(|(_, end)| end >= at.saturating_add(len))
+}
+
+pub(crate) fn private_readwrite_region(at: usize) -> Option<(usize, usize)> {
     // SAFETY: plain data filled in by the query.
     let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { mem::VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) };
-    n != 0
+    (n != 0
         && info.State == mem::MEM_COMMIT
         && info.Type == mem::MEM_PRIVATE
-        && info.Protect == mem::PAGE_READWRITE
-        && (info.BaseAddress as usize).saturating_add(info.RegionSize) >= at.saturating_add(len)
+        && info.Protect == mem::PAGE_READWRITE)
+        .then(|| {
+            let start = info.BaseAddress as usize;
+            (start, start.saturating_add(info.RegionSize))
+        })
 }
 
 fn hr<T>(result: &windows::core::Result<T>) -> String {

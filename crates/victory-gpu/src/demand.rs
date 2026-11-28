@@ -380,13 +380,22 @@ fn fulfill_block(block: usize, permanent: bool) -> bool {
         for p in &entry.pieces {
             let len = p.hi - p.lo;
             let raw = windows::core::Interface::as_raw(&p.shadow.buffer) as usize;
-            if len > 0 && raw > 0x1000 && host.demand_fetch(&p.shadow.buffer, p.lo as u64, len, &mut gpu) {
+            if len == 0 || raw <= 0x1000 {
+                continue;
+            }
+            let started = crate::rf_x3::timer();
+            let fetched = host.demand_fetch(&p.shadow.buffer, p.lo as u64, len, &mut gpu);
+            if fetched {
                 total_bytes += len as u64;
                 let ptr = gpu.as_ptr() as usize;
                 // SAFETY: `gpu` holds `len` bytes just fetched for `[p.lo, p.hi)`.
                 unsafe {
                     p.shadow.land_card(&[(p.lo, p.hi, ptr)], p.fetched_after, &mut notes);
                 }
+            }
+            if let Some(started) = started {
+                use crate::rf_x3::{Object, Source, elapsed, work};
+                work(Object::shadow(&p.shadow), Source::DemandFetch, if fetched { len as u64 } else { 0 }, elapsed(started));
             }
         }
     }

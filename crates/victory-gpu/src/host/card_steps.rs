@@ -532,7 +532,7 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
                     len,
                     asked: copy_blocked(written, dst, src, len).is_some(),
                 },
-                Step::Fill(_, src, len, to) => Does::Fill {
+                Step::Fill(_, src, len, to, _) => Does::Fill {
                     src: *src,
                     len: *len,
                     asked: read_blocked(written, *src, *len),
@@ -618,7 +618,7 @@ type HashMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefau
 fn fill_to(runs: &[&HostList], step: (usize, usize)) -> Option<FillTo> {
     let list = runs.iter().find(|l| std::ptr::from_ref::<HostList>(l) as usize == step.0)?;
     match list.deferred().copies.get(step.1)? {
-        Step::Fill(_, _, _, to) => to.clone(),
+        Step::Fill(_, _, _, to, _) => to.clone(),
         _ => None,
     }
 }

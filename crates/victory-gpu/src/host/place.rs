@@ -176,7 +176,7 @@ pub(super) enum Waits {
 pub(super) fn reads(step: &Step, ranges: &[(usize, usize)]) -> bool {
     let meets = |from: usize, to: usize| from < to && ranges.iter().any(|r| r.0 < to && from < r.1);
     match step {
-        &Step::Copy(_, src, len) | &Step::Fill(_, src, len, _) => meets(src, src.saturating_add(len)),
+        &Step::Copy(_, src, len) | &Step::Fill(_, src, len, ..) => meets(src, src.saturating_add(len)),
         Step::Texture(staging) => {
             let (at, len) = staging.memory();
             meets(at, at.saturating_add(len))
