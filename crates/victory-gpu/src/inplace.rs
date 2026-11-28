@@ -414,6 +414,19 @@ pub(crate) fn pages_of(page: usize) -> Vec<usize> {
     v.pages.get(&(section, offset + within as u64)).cloned().unwrap_or_default()
 }
 
+/// Whether the mapping registry knows exactly one title view of this page.
+/// Unknown mappings and even very widely aliased pages are ineligible.
+pub(crate) fn single_title_view(page: usize) -> bool {
+    let v = views();
+    let Some((&base, &(bytes, section, offset))) = v.views.range(..=page).next_back() else {
+        return false;
+    };
+    let within = page - base;
+    within < bytes
+        && within.is_multiple_of(K64)
+        && v.pages.get(&(section, offset + within as u64)).is_some_and(|shown| shown.as_slice() == [page])
+}
+
 /// The title views that show any of the physical bytes `[offset, offset +
 /// len)` of `section`, as `(address, bytes)` ranges in address order; not
 /// those of a page shown in very many views (`MANY_VIEWS`).

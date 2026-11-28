@@ -3697,6 +3697,7 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
 /// for the first time, is read as it was before that flight.
 fn fill_is_titles(src: usize, len: usize) -> bool {
     const SMALL: usize = 64 << 10;
+    if crate::watch::dirty_pending(src, src.saturating_add(len)) { return false; } // rf-x5
     len <= SMALL && (crate::watch::written_since_taken(src, len) || !crate::watch::landed_lately(src, len, 600))
 }
 
@@ -4751,6 +4752,8 @@ mod prefetch;
 #[cfg(test)]
 pub(crate) use prefetch::{CARD_SPILL, STRIDE as SPILL_STRIDE};
 mod send;
+#[path = "rf_x5.rs"] // rf-x5
+pub(crate) mod rf_x5; // rf-x5
 pub(crate) use send::{goes_as_words, words_under};
 mod shown;
 #[cfg(feature = "diagnostics")]
@@ -11037,6 +11040,7 @@ impl Meter {
         crate::copystat::presented();
         self.frames += 1;
         self.rf_x3.present(); // rf-x3
+        rf_x5::present(); // rf-x5
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
@@ -11088,7 +11092,10 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         spans::line(frames);
         crate::shadow::back_line(frames);
-        submit_split_line(frames, |split, flushes| self.rf_x3.sample(elapsed, frames as u64, preparing, prepare_us, split, flushes)); // rf-x3
+        submit_split_line(frames, |split, flushes| { // rf-x5
+            self.rf_x3.sample(elapsed, frames as u64, preparing, prepare_us, split, flushes); // rf-x3
+            rf_x5::sample(elapsed, frames as u64, prepare_us, split); // rf-x5
+        }); // rf-x5
         fresh_open_line(frames);
         crate::heap_marks::line(frames);
         crate::pipeline::rf_x6::line(frames); // rf-x6

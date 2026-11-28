@@ -4595,7 +4595,9 @@ impl Shadow {
         if busy.is_empty() {
             return false;
         }
-        if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+        if self.watched.load(Ordering::Relaxed) == NOT_WATCHED
+            || busy.iter().any(|&(a, e)| crate::watch::dirty_pending(a, e))
+        {
             return true;
         }
         let base = start / PAGE;
@@ -4642,7 +4644,9 @@ impl Shadow {
         if busy.is_empty() {
             return false;
         }
-        if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+        if self.watched.load(Ordering::Relaxed) == NOT_WATCHED
+            || busy.iter().any(|&(a, e)| crate::watch::dirty_pending(a, e))
+        {
             note_stale(0);
             return true;
         }
@@ -5196,6 +5200,15 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
+        if crate::watch::dirty_copy(from, to) {
+            // No clean stamp is issued. These are gaps outside pending GPU
+            // writes, and `take` still honors the card's upload bookkeeping.
+            let _pin = crate::demand::pin_range(from, to - from);
+            crate::demand::fulfill_range(from, to - from, false);
+            let _copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            crate::host::rf_x5::copied(to - from);
+            return self.take_all(vec![(from, to, false)]);
+        }
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             let clean_before = (self.pending_len.load(Ordering::Acquire) == 0)
                 .then(|| crate::watch::block_write_sig(from, to))
